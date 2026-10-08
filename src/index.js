@@ -229,8 +229,25 @@ function handleEvent(repo) {
       switch (ev.type) {
         case "permission.asked":
           return await onPermissionAsked(repo, ev.properties);
+        case "permission.replied": {
+          const id = ev.properties.requestID;
+          if (pendingAsks.has(id)) {
+            console.log(`[ask] permission ${id} answered elsewhere — cleaning up`);
+            pendingAsks.delete(id);
+          }
+          return;
+        }
         case "question.asked":
           return await onQuestionAsked(repo, ev.properties);
+        case "question.replied":
+        case "question.rejected": {
+          const id = ev.properties.requestID;
+          if (pendingAsks.has(id)) {
+            console.log(`[ask] question ${id} answered elsewhere (${ev.type}) — cleaning up`);
+            pendingAsks.delete(id);
+          }
+          return;
+        }
         case "message.updated":
           return await onMessageUpdated(repo, ev.properties);
         case "message.part.updated":
@@ -246,6 +263,26 @@ function handleEvent(repo) {
       console.error(`[ev:${repo}] ${ev.type} handler failed:`, e.message);
     }
   };
+}
+
+function startReconcile() {
+  setInterval(async () => {
+    try {
+      const serverIds = new Set();
+      for (const [, inst] of manager.instances) {
+        try {
+          for (const p of await inst.pendingPermissions()) serverIds.add(p.id);
+          for (const q of await inst.pendingQuestions()) serverIds.add(q.id);
+        } catch {}
+      }
+      for (const id of [...pendingAsks.keys()]) {
+        if (!serverIds.has(id)) {
+          console.log(`[ask] reconcile: dropping stale ${id}`);
+          pendingAsks.delete(id);
+        }
+      }
+    } catch {}
+  }, 60000).unref();
 }
 
 async function announcePending() {
@@ -798,6 +835,7 @@ async function main() {
   }
   await manager.ensureAll();
   manager.startWatchdog();
+  startReconcile();
   for (const [name, inst] of manager.instances) {
     console.log(`[bridge] opencode[${name}] ${inst.adopted ? "adopted" : "spawned"} at ${inst.base} (${inst.dir})`);
     inst.watchEvents(handleEvent(name));
