@@ -362,9 +362,10 @@ async function findFirstServerQuestion() {
 }
 
 async function submitAnswers(ask) {
-  await manager.get(ask.repo).replyQuestion(ask.reqId, ask.answers);
+  const payload = ask.answers.map((a) => (Array.isArray(a) ? a : [a]));
+  await manager.get(ask.repo).replyQuestion(ask.reqId, payload);
   pendingAsks.delete(ask.reqId);
-  console.log(`[ask] submitted answers for ${ask.reqId}: ${JSON.stringify(ask.answers)}`);
+  console.log(`[ask] submitted answers for ${ask.reqId}: ${JSON.stringify(payload)}`);
 }
 
 function ownerOnly() {
