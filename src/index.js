@@ -1,11 +1,16 @@
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const { Bot, InlineKeyboard } = require("grammy");
-const oc = require("./oc");
+const { ServerManager } = require("./oc");
 const state = require("./state");
-const { mdToHtml, splitHtml, esc } = require("./format");
+const { mdToHtml, splitHtml, esc, fmtDiff, fmtTodos, fmtCost } = require("./format");
+const { TurnView, editSafe } = require("./stream");
+const media = require("./media");
 
 const OWNER = String(process.env.TELEGRAM_OWNER_ID || "");
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const PASSWORD = process.env.OPENCODE_SERVER_PASSWORD || "";
 if (!TOKEN || !OWNER) {
   console.error("[bridge] TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID are required");
   process.exit(1);
@@ -13,12 +18,15 @@ if (!TOKEN || !OWNER) {
 
 const sentMessages = new Set();
 const toolSeen = new Set();
-const expectingText = new Set();
+const expectingTurn = new Set();
 const retryNotified = new Set();
 const pendingAsks = new Map();
+const turnViews = new Map();
 let bot;
+let manager;
 
 const ownerChat = () => state.get().chatId || Number(OWNER);
+const activeRepoName = () => state.get().activeRepo || Object.keys(state.get().repos)[0];
 
 async function push(chatId, html, extra = {}) {
   const outs = [];
@@ -37,67 +45,60 @@ async function push(chatId, html, extra = {}) {
   return outs;
 }
 
-async function activeSession() {
-  const sid = state.get().activeSessionId;
+async function activeSession(repo) {
+  const sid = state.get().activeSessions[repo];
+  const inst = manager.get(repo);
   if (sid) {
     try {
-      const sessions = await oc.listSessions();
+      const sessions = await inst.listSessions();
       if (sessions.some((s) => s.id === sid)) return sid;
     } catch {}
   }
-  const s = await oc.createSession(`tg ${new Date().toISOString().slice(0, 16)}`);
-  state.set({ activeSessionId: s.id });
+  const s = await inst.createSession(`tg ${new Date().toISOString().slice(0, 16)}`);
+  state.set({ activeSessions: { ...state.get().activeSessions, [repo]: s.id } });
   return s.id;
 }
 
-async function sendPrompt(chatId, text) {
-  const sid = await activeSession();
+function turnKey(repo, sid) {
+  return `${repo}|${sid}`;
+}
+
+async function sendPrompt(chatId, parts, opts = {}) {
+  const repo = activeRepoName();
+  const inst = manager.get(repo);
+  if (!inst) {
+    await push(chatId, "⚠️ No active repo — use /repo first.");
+    return;
+  }
+  const sid = await activeSession(repo);
+  const view = new TurnView(bot, chatId);
+  turnViews.set(turnKey(repo, sid), view);
+  await view.ensureActivity();
   try {
-    await oc.promptAsync(sid, text);
+    await inst.promptAsync(sid, parts, {
+      agent: opts.agent || state.get().activeAgents[repo],
+      model: opts.model || state.get().activeModels[repo]
+    });
   } catch (e) {
+    await view.finalize("");
+    turnViews.delete(turnKey(repo, sid));
     await push(chatId, `⚠️ Could not send: <code>${esc(e.message)}</code>\nSession may be busy — /abort to stop it.`);
     return;
   }
-  expectingText.add(sid);
-  await push(chatId, "⏳ Working on it…");
+  expectingTurn.add(turnKey(repo, sid));
 }
 
-function toolArg(part) {
-  const i = part.state?.input || {};
-  const v = i.command || i.description || i.url || i.query || i.pattern || i.filePath || i.file_path || "";
-  return String(v).slice(0, 120);
-}
-
-async function handleEvent(ev) {
-  try {
-    switch (ev.type) {
-      case "permission.asked":
-        return await onPermissionAsked(ev.properties);
-      case "question.asked":
-        return await onQuestionAsked(ev.properties);
-      case "message.updated":
-        return await onMessageUpdated(ev.properties);
-      case "message.part.updated":
-        return await onPartUpdated(ev.properties);
-      case "session.status":
-        return await onSessionStatus(ev.properties);
-      case "session.idle":
-        return await onSessionIdle(ev.properties);
-    }
-  } catch (e) {
-    console.error(`[ev] ${ev.type} handler failed:`, e.message);
-  }
-}
-
-async function onPermissionAsked(p) {
+async function onPermissionAsked(repo, p) {
+  if (pendingAsks.has(p.id)) return;
   const what = p.metadata?.command || (p.patterns || []).join(", ") || p.permission;
-  const html = `🔐 <b>Permission needed</b>\ntool: <code>${esc(p.permission)}</code>\n<code>${esc(what)}</code>`;
+  const repoTag = Object.keys(state.get().repos).length > 1 ? `[${repo}] ` : "";
+  const html = `${repoTag}🔐 <b>Permission needed</b>\ntool: <code>${esc(p.permission)}</code>\n<code>${esc(what)}</code>`;
   const kb = new InlineKeyboard()
     .text("✅ Once", `p|${p.id}|once`)
     .text("🔁 Always", `p|${p.id}|always`)
     .text("❌ Deny", `p|${p.id}|reject`);
   const msgs = await push(ownerChat(), html, { reply_markup: kb });
-  pendingAsks.set(p.id, { kind: "permission", reqId: p.id, chatId: ownerChat(), messageIds: msgs.map((m) => m.message_id) });
+  pendingAsks.set(p.id, { kind: "permission", reqId: p.id, repo, chatId: ownerChat(), messageIds: msgs.map((m) => m.message_id) });
 }
 
 function questionText(q) {
@@ -107,10 +108,12 @@ function questionText(q) {
   return t;
 }
 
-async function onQuestionAsked(p) {
+async function onQuestionAsked(repo, p) {
+  if (pendingAsks.has(p.id)) return;
   const ask = {
     kind: "question",
     reqId: p.id,
+    repo,
     chatId: ownerChat(),
     questions: p.questions,
     answers: p.questions.map(() => null),
@@ -130,29 +133,34 @@ async function onQuestionAsked(p) {
   }
 }
 
-async function onMessageUpdated({ sessionID, info }) {
+async function onMessageUpdated(repo, { sessionID, info }) {
   if (info.role !== "assistant") return;
   if (!info.time?.completed) return;
   if (sentMessages.has(info.id)) return;
   sentMessages.add(info.id);
   if (sentMessages.size > 500) sentMessages.clear();
   const chatId = ownerChat();
+  const key = turnKey(repo, sessionID);
   try {
-    const full = await oc.getMessage(sessionID, info.id);
+    const full = await manager.get(repo).getMessage(sessionID, info.id);
     if (info.error) {
       const msg = typeof info.error === "string" ? info.error : JSON.stringify(info.error);
       await push(chatId, `❌ <b>Error</b>\n${esc(msg.slice(0, 800))}`);
-      expectingText.delete(sessionID);
+      expectingTurn.delete(key);
       return;
     }
-    const texts = (full.parts || [])
+    const text = (full.parts || [])
       .filter((p) => p.type === "text")
       .map((p) => p.text)
       .join("\n\n");
-    if (texts.trim()) {
-      await push(chatId, mdToHtml(texts));
-      expectingText.delete(sessionID);
+    const view = turnViews.get(key);
+    if (view) {
+      view.sentText = Boolean(text.trim());
+      await view.finalize(text);
+    } else if (text.trim()) {
+      await push(chatId, mdToHtml(text));
     }
+    expectingTurn.delete(key);
   } catch (e) {
     console.error("[ev] message fetch failed:", e.message);
   }
@@ -160,50 +168,116 @@ async function onMessageUpdated({ sessionID, info }) {
 
 const QUIET_TOOLS = new Set(["read", "glob", "grep", "question", "todowrite", "todoread"]);
 
-async function onPartUpdated({ part }) {
+function toolLine(part) {
+  const i = part.state?.input || {};
+  const arg = i.command || i.description || i.url || i.query || i.pattern || i.filePath || i.file_path || "";
+  return `${part.tool}${arg ? " — " + String(arg).slice(0, 100) : ""}`;
+}
+
+async function onPartUpdated(repo, { part }) {
+  const view0 = turnViews.get(`${repo}|${part.sessionID}`);
+  if (view0 && !view0.closed) view0.notePart(part);
   if (part.type !== "tool" || QUIET_TOOLS.has(part.tool)) return;
+  const view = turnViews.get(`${repo}|${part.sessionID}`);
   const st = part.state?.status;
   if (st === "running") {
     if (toolSeen.has(part.id)) return;
     toolSeen.add(part.id);
     if (toolSeen.size > 1000) toolSeen.clear();
-    const arg = toolArg(part);
-    await push(ownerChat(), `🔨 <code>${esc(part.tool)}</code>${arg ? " — " + esc(arg) : ""}`);
+    view?.addTool(toolLine(part));
   } else if (st === "error") {
-    if (toolSeen.has(part.id + ":err")) return;
-    toolSeen.add(part.id + ":err");
     const errTxt = part.state?.error || "failed";
-    await push(ownerChat(), `⚠️ <code>${esc(part.tool)}</code> — ${esc(String(errTxt).slice(0, 150))}`);
+    view?.addTool(`${part.tool} ⚠️ ${String(errTxt).slice(0, 80)}`);
   }
 }
 
-async function onSessionStatus({ sessionID, status }) {
+async function onDelta(repo, d) {
+  if (d.field !== "text") return;
+  const view = turnViews.get(turnKey(repo, d.sessionID));
+  view?.addDelta(d.partID, d.field, d.delta);
+}
+
+async function onSessionStatus(repo, { sessionID, status }) {
   if (status.type !== "retry") {
-    retryNotified.delete(sessionID);
+    retryNotified.delete(`${repo}|${sessionID}`);
     return;
   }
-  if (retryNotified.has(sessionID)) return;
-  retryNotified.add(sessionID);
-  await push(ownerChat(), `⚠️ Provider retry (attempt ${status.attempt}): ${esc((status.message || "").slice(0, 200))}`);
+  const key = `${repo}|${sessionID}`;
+  if (retryNotified.has(key)) return;
+  retryNotified.add(key);
+  await push(ownerChat(), `⚠️ [${repo}] Provider retry (attempt ${status.attempt}): ${esc((status.message || "").slice(0, 200))}`);
 }
 
-async function onSessionIdle({ sessionID }) {
-  if (expectingText.has(sessionID)) {
-    expectingText.delete(sessionID);
+async function onSessionIdle(repo, sessionID) {
+  const key = turnKey(repo, sessionID);
+  const view = turnViews.get(key);
+  if (view) {
+    if (!view.closed) await view.finalize("");
+    turnViews.delete(key);
+  }
+  if (expectingTurn.has(key)) {
+    expectingTurn.delete(key);
     await push(ownerChat(), "✅ Finished (no text output).");
   }
 }
 
-async function announcePending() {
-  let perms = [];
-  let questions = [];
-  try {
-    perms = await oc.pendingPermissions();
-    questions = await oc.pendingQuestions();
-  } catch {}
-  for (const p of perms) if (!pendingAsks.has(p.id)) await onPermissionAsked(p);
-  for (const q of questions) if (!pendingAsks.has(q.id)) await onQuestionAsked(q);
+function handleEvent(repo) {
+  return async (ev) => {
+    try {
+      switch (ev.type) {
+        case "permission.asked":
+          return await onPermissionAsked(repo, ev.properties);
+        case "question.asked":
+          return await onQuestionAsked(repo, ev.properties);
+        case "message.updated":
+          return await onMessageUpdated(repo, ev.properties);
+        case "message.part.updated":
+          return await onPartUpdated(repo, ev.properties);
+        case "message.part.delta":
+          return await onDelta(repo, ev.properties);
+        case "session.status":
+          return await onSessionStatus(repo, ev.properties);
+        case "session.idle":
+          return await onSessionIdle(repo, ev.properties.sessionID);
+      }
+    } catch (e) {
+      console.error(`[ev:${repo}] ${ev.type} handler failed:`, e.message);
+    }
+  };
 }
+
+async function announcePending() {
+  for (const [name, inst] of manager.instances) {
+    try {
+      const perms = await inst.pendingPermissions();
+      for (const p of perms) await onPermissionAsked(name, p);
+      const questions = await inst.pendingQuestions();
+      for (const q of questions) await onQuestionAsked(name, q);
+    } catch {}
+  }
+}
+
+const POLICY = {
+  $schema: "https://opencode.ai/config.json",
+  permission: {
+    bash: {
+      "*": "ask",
+      "git status*": "allow",
+      "git log*": "allow",
+      "git diff*": "allow",
+      "ls*": "allow",
+      "dir*": "allow",
+      "cat *": "allow",
+      "echo *": "allow",
+      pwd: "allow",
+      "node *": "allow",
+      "npm *": "allow"
+    },
+    webfetch: "allow",
+    websearch: "allow",
+    edit: "allow"
+  }
+};
 
 function ownerOnly() {
   return async (ctx, next) => {
@@ -215,92 +289,300 @@ function ownerOnly() {
 }
 
 async function sessionsList(chatId) {
-  const sessions = (await oc.listSessions())
+  const repo = activeRepoName();
+  const inst = manager.get(repo);
+  const sessions = (await inst.listSessions())
     .filter((s) => !s.parentID)
     .sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0))
     .slice(0, 15);
-  state.set({ lastSessionList: sessions.map((s) => s.id) });
-  const active = state.get().activeSessionId;
+  state.set({ lastSessionLists: { ...state.get().lastSessionLists, [repo]: sessions.map((s) => s.id) } });
+  const active = state.get().activeSessions[repo];
   const lines = sessions.map(
     (s, i) => `${s.id === active ? "▶️" : `<b>${i + 1}.</b>`} ${esc((s.title || "untitled").slice(0, 60))}\n      <i>${esc(s.id)}</i>`
   );
-  await push(chatId, lines.length ? lines.join("\n") : "No sessions yet — send a message or /new");
+  await push(chatId, `<b>repo: ${esc(repo)}</b>\n\n${lines.length ? lines.join("\n") : "No sessions yet — send a message or /new"}`);
+}
+
+async function modelsList(inst, query) {
+  const cfg = await inst.api("GET", "/config/providers");
+  const entries = [];
+  for (const p of cfg.providers || []) {
+    const models = p.models || {};
+    const keys = Array.isArray(models) ? models.map((m) => m.id || m) : Object.keys(models);
+    for (const m of keys) entries.push(`${p.id}/${m}`);
+  }
+  const q = (query || "").toLowerCase();
+  const filtered = q ? entries.filter((e) => e.toLowerCase().includes(q)) : entries;
+  return filtered.slice(0, 40);
 }
 
 function registerCommands() {
   const helpText = [
     "<b>TeleCode</b> — opencode on Telegram",
     "",
-    "Type any message → it goes to the active opencode session.",
-    "When the session needs approval or asks a question, it appears here with buttons.",
+    "Type any message → prompt to the active session (streamed live).",
+    "Photos/documents + caption → sent to the session.",
+    "Approvals and questions arrive here as buttons.",
     "",
-    "/new &lt;title&gt; — start a fresh session",
-    "/sessions — list recent sessions",
-    "/switch &lt;n&gt; — switch to session n",
-    "/abort — stop the current task",
-    "/pending — show pending approvals/questions",
-    "/status — bridge status"
+    "/new &lt;title&gt; — fresh session",
+    "/sessions — list · /switch &lt;n&gt; — switch",
+    "/abort — stop current task",
+    "/repo — list · /repo &lt;name&gt; — switch",
+    "/repo add &lt;name&gt; &lt;path&gt; — add a repo",
+    "/repo remove &lt;name&gt;",
+    "/model [provider/model | list &lt;q&gt;]",
+    "/agent [name]",
+    "/diff · /todos · /cost · /share · /revert",
+    "/pending — un-answered approvals · /status"
   ].join("\n");
 
   bot.command("start", (ctx) => push(ctx.chat.id, helpText));
   bot.command("help", (ctx) => push(ctx.chat.id, helpText));
 
   bot.command("new", async (ctx) => {
+    const repo = activeRepoName();
     const title = (ctx.match || "").trim() || `tg ${new Date().toISOString().slice(0, 16)}`;
-    const s = await oc.createSession(title.slice(0, 80));
-    state.set({ activeSessionId: s.id });
-    await push(ctx.chat.id, `🆕 Session started: <b>${esc(title.slice(0, 80))}</b>\n<code>${esc(s.id)}</code>`);
+    const s = await manager.get(repo).createSession(title.slice(0, 80));
+    state.set({ activeSessions: { ...state.get().activeSessions, [repo]: s.id } });
+    await push(ctx.chat.id, `🆕 [${esc(repo)}] Session: <b>${esc(title.slice(0, 80))}</b>\n<code>${esc(s.id)}</code>`);
   });
 
   bot.command("sessions", async (ctx) => sessionsList(ctx.chat.id));
 
   bot.command("switch", async (ctx) => {
+    const repo = activeRepoName();
     const n = parseInt((ctx.match || "").trim(), 10);
-    const list = state.get().lastSessionList;
+    const list = state.get().lastSessionLists[repo] || [];
     if (!n || n < 1 || n > list.length) {
       await push(ctx.chat.id, "Usage: /switch &lt;n&gt; — run /sessions first.");
       return;
     }
     const sid = list[n - 1];
-    state.set({ activeSessionId: sid });
-    await push(ctx.chat.id, `🔄 Switched to <code>${esc(sid)}</code>`);
+    state.set({ activeSessions: { ...state.get().activeSessions, [repo]: sid } });
+    await push(ctx.chat.id, `🔄 [${esc(repo)}] Switched to <code>${esc(sid)}</code>`);
   });
 
   bot.command("abort", async (ctx) => {
-    const sid = state.get().activeSessionId;
+    const repo = activeRepoName();
+    const sid = state.get().activeSessions[repo];
     if (!sid) {
       await push(ctx.chat.id, "No active session.");
       return;
     }
     try {
-      await oc.abortSession(sid);
-      expectingText.delete(sid);
+      await manager.get(repo).abortSession(sid);
+      const key = turnKey(repo, sid);
+      expectingTurn.delete(key);
+      const view = turnViews.get(key);
+      if (view && !view.closed) await view.finalize("");
       await push(ctx.chat.id, "🛑 Abort sent.");
     } catch (e) {
       await push(ctx.chat.id, `⚠️ Abort failed: ${esc(e.message)}`);
     }
   });
 
+  bot.command("repo", async (ctx) => {
+    const arg = (ctx.match || "").trim();
+    const repos = state.get().repos;
+    if (!arg) {
+      const lines = Object.entries(repos).map(([name, r]) =>
+        `${name === state.get().activeRepo ? "▶️" : "•"} <b>${esc(name)}</b> — <code>${esc(r.dir)}</code> :${r.port}`
+      );
+      await push(ctx.chat.id, `<b>Repos</b>\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`);
+      return;
+    }
+    if (arg.startsWith("add ")) {
+      const rest = arg.slice(4).trim();
+      const sp = rest.indexOf(" ");
+      if (sp < 0) {
+        await push(ctx.chat.id, "Usage: /repo add &lt;name&gt; &lt;path&gt;");
+        return;
+      }
+      const name = rest.slice(0, sp).toLowerCase().replace(/[^a-z0-9-]/g, "");
+      const dir = rest.slice(sp + 1).trim();
+      if (!name || !dir) {
+        await push(ctx.chat.id, "Usage: /repo add &lt;name&gt; &lt;path&gt;");
+        return;
+      }
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+        await push(ctx.chat.id, `⚠️ Not a directory: <code>${esc(dir)}</code>`);
+        return;
+      }
+      if (repos[name]) {
+        await push(ctx.chat.id, `⚠️ Repo <b>${esc(name)}</b> exists — /repo remove ${esc(name)} first.`);
+        return;
+      }
+      const port = manager.allocPort();
+      const cfgPath = path.join(dir, "opencode.json");
+      let policyNote = "";
+      if (!fs.existsSync(cfgPath)) {
+        fs.writeFileSync(cfgPath, JSON.stringify(POLICY, null, 2));
+        policyNote = " (bash-ask policy written)";
+      }
+      manager.register(name, dir, port);
+      state.set({
+        repos: { ...repos, [name]: { dir, port } },
+        activeRepo: name
+      });
+      try {
+        await manager.get(name).ensure();
+      } catch (e) {
+        await push(ctx.chat.id, `⚠️ Repo added but server failed: ${esc(e.message)}`);
+        return;
+      }
+      manager.get(name).watchEvents(handleEvent(name));
+      await push(ctx.chat.id, `📁 Repo <b>${esc(name)}</b> added &amp; active${esc(policyNote)}\n<code>${esc(dir)}</code> :${port}`);
+      return;
+    }
+    if (arg.startsWith("remove ")) {
+      const name = arg.slice(7).trim();
+      if (!repos[name]) {
+        await push(ctx.chat.id, "No such repo.");
+        return;
+      }
+      if (name === state.get().activeRepo) {
+        await push(ctx.chat.id, "Switch away first — it is the active repo.");
+        return;
+      }
+      const reposNext = { ...repos };
+      delete reposNext[name];
+      const inst = manager.get(name);
+      try {
+        inst?.child?.kill();
+      } catch {}
+      state.set({ repos: reposNext });
+      await push(ctx.chat.id, `🗑 Repo <b>${esc(name)}</b> removed (its server may keep running).`);
+      return;
+    }
+    const name = arg.toLowerCase();
+    if (!repos[name]) {
+      await push(ctx.chat.id, "No such repo — /repo to list, /repo add to add.");
+      return;
+    }
+    state.set({ activeRepo: name });
+    await push(ctx.chat.id, `▶️ Active repo: <b>${esc(name)}</b>\n<code>${esc(repos[name].dir)}</code> :${repos[name].port}`);
+  });
+
+  bot.command("model", async (ctx) => {
+    const repo = activeRepoName();
+    const inst = manager.get(repo);
+    const arg = (ctx.match || "").trim();
+    if (!arg) {
+      const cur = state.get().activeModels[repo] || "(provider default)";
+      await push(ctx.chat.id, `🧠 [${esc(repo)}] model: <b>${esc(cur)}</b>\n/model list [query] — browse\n/model provider/model — set\n/model clear — reset`);
+      return;
+    }
+    if (arg === "clear") {
+      state.set({ activeModels: { ...state.get().activeModels, [repo]: undefined } });
+      await push(ctx.chat.id, "🧠 Model override cleared.");
+      return;
+    }
+    if (arg.startsWith("list")) {
+      const query = arg.slice(4).trim();
+      const entries = await modelsList(inst, query);
+      await push(ctx.chat.id, `<b>Models${query ? ` matching "${esc(query)}"` : ""} (first 40)</b>\n${entries.map((e) => `• <code>${esc(e)}</code>`).join("\n") || "none"}`);
+      return;
+    }
+    if (!arg.includes("/")) {
+      await push(ctx.chat.id, "Format: <code>providerID/modelID</code>");
+      return;
+    }
+    const entries = await modelsList(inst, "");
+    if (!entries.includes(arg)) {
+      await push(ctx.chat.id, `⚠️ Unknown model <code>${esc(arg)}</code> — /model list ${esc(arg.split("/")[0])}`);
+      return;
+    }
+    state.set({ activeModels: { ...state.get().activeModels, [repo]: arg } });
+    await push(ctx.chat.id, `🧠 [${esc(repo)}] Model set: <b>${esc(arg)}</b>`);
+  });
+
+  bot.command("agent", async (ctx) => {
+    const repo = activeRepoName();
+    const inst = manager.get(repo);
+    const arg = (ctx.match || "").trim();
+    const agents = await inst.api("GET", "/agent");
+    if (!arg) {
+      await push(
+        ctx.chat.id,
+        `<b>Agents [${esc(repo)}]</b>\n${agents.map((a) => `${a.mode === "subagent" ? "▫️" : "•"} <code>${esc(a.name)}</code> <i>${esc(a.mode || "")}</i>`).join("\n")}\n\n/agent &lt;name&gt; — set`
+      );
+      return;
+    }
+    const found = agents.find((a) => a.name === arg);
+    if (!found) {
+      await push(ctx.chat.id, `⚠️ No agent named <code>${esc(arg)}</code>`);
+      return;
+    }
+    state.set({ activeAgents: { ...state.get().activeAgents, [repo]: arg } });
+    await push(ctx.chat.id, `🤖 [${esc(repo)}] Agent set: <b>${esc(arg)}</b>`);
+  });
+
+  bot.command("diff", async (ctx) => {
+    const repo = activeRepoName();
+    const sid = state.get().activeSessions[repo];
+    if (!sid) return push(ctx.chat.id, "No active session.");
+    const diffs = await manager.get(repo).sessionDiff(sid);
+    await push(ctx.chat.id, `<b>[${esc(repo)}] Diff</b>\n${fmtDiff(diffs)}`);
+  });
+
+  bot.command("todos", async (ctx) => {
+    const repo = activeRepoName();
+    const sid = state.get().activeSessions[repo];
+    if (!sid) return push(ctx.chat.id, "No active session.");
+    const todos = await manager.get(repo).sessionTodo(sid);
+    await push(ctx.chat.id, `<b>[${esc(repo)}] Todos</b>\n${fmtTodos(todos)}`);
+  });
+
+  bot.command("cost", async (ctx) => {
+    const repo = activeRepoName();
+    const sid = state.get().activeSessions[repo];
+    if (!sid) return push(ctx.chat.id, "No active session.");
+    const s = await manager.get(repo).sessionDetail(sid);
+    await push(ctx.chat.id, `<b>[${esc(repo)}]</b> ${esc((s.title || "").slice(0, 50))}\n${fmtCost(s)}`);
+  });
+
+  bot.command("share", async (ctx) => {
+    const repo = activeRepoName();
+    const sid = state.get().activeSessions[repo];
+    if (!sid) return push(ctx.chat.id, "No active session.");
+    const s = await manager.get(repo).shareSession(sid);
+    const url = s?.share?.url;
+    await push(ctx.chat.id, url ? `🔗 ${esc(url)}` : "⚠️ Sharing not available.");
+  });
+
+  bot.command("revert", async (ctx) => {
+    const repo = activeRepoName();
+    const sid = state.get().activeSessions[repo];
+    if (!sid) return push(ctx.chat.id, "No active session.");
+    const inst = manager.get(repo);
+    const msgs = await inst.api("GET", `/session/${sid}/message`);
+    const lastUser = [...msgs].reverse().find((m) => m.info.role === "user");
+    if (!lastUser) return push(ctx.chat.id, "Nothing to revert.");
+    await inst.revertSession(sid, lastUser.info.id);
+    await push(ctx.chat.id, "⏪ Reverted last turn.");
+  });
+
   bot.command("status", async (ctx) => {
-    const sid = state.get().activeSessionId;
+    const repo = activeRepoName();
+    const sid = state.get().activeSessions[repo];
     let statusLine = "no active session";
     let title = "-";
     if (sid) {
       try {
-        const sts = await oc.sessionStatuses();
+        const sts = await manager.get(repo).sessionStatuses();
         const st = sts[sid];
         statusLine = st ? st.type : "idle";
-        const s = (await oc.listSessions()).find((x) => x.id === sid);
+        const s = (await manager.get(repo).listSessions()).find((x) => x.id === sid);
         title = s?.title || "-";
       } catch {}
     }
     let version = "?";
     try {
-      version = (await oc.api("GET", "/global/health")).version;
+      version = (await manager.get(repo).api("GET", "/global/health")).version;
     } catch {}
     await push(
       ctx.chat.id,
-      `🟢 TeleCode bridge\nopencode: <code>${esc(version)}</code>\nsession: <b>${esc(title)}</b>\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\npending asks: ${pendingAsks.size}`
+      `🟢 TeleCode bridge\nopencode: <code>${esc(version)}</code>\nrepo: <b>${esc(repo)}</b>\nsession: ${esc(title)}\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\nmodel: <b>${esc(state.get().activeModels[repo] || "default")}</b>\nagent: <b>${esc(state.get().activeAgents[repo] || "default")}</b>\npending asks: ${pendingAsks.size}`
     );
   });
 
@@ -316,7 +598,8 @@ function registerCallbacks() {
     try {
       if (data.startsWith("p|")) {
         const [, reqId, choice] = data.split("|");
-        await oc.replyPermission(reqId, choice);
+        const ask = pendingAsks.get(reqId);
+        await manager.get(ask?.repo || activeRepoName()).replyPermission(reqId, choice);
         const label = choice === "once" ? "approved (once)" : choice === "always" ? "approved (always)" : "denied";
         await ctx.editMessageText(`${choice === "reject" ? "❌" : "✅"} Permission ${label}.`).catch(() => {});
         pendingAsks.delete(reqId);
@@ -333,7 +616,7 @@ function registerCallbacks() {
         ask.answers[Number(qi)] = label;
         await ctx.editMessageText(`✔️ ${esc(label)}`).catch(() => {});
         if (ask.answers.every((a) => a !== null)) {
-          await oc.replyQuestion(reqId, ask.answers);
+          await manager.get(ask.repo).replyQuestion(reqId, ask.answers);
           pendingAsks.delete(reqId);
           await ctx.answerCallbackQuery({ text: "Answer sent" });
         } else {
@@ -342,8 +625,9 @@ function registerCallbacks() {
         }
       } else if (data.startsWith("qrej|")) {
         const [, reqId] = data.split("|");
+        const ask = pendingAsks.get(reqId);
         pendingAsks.delete(reqId);
-        await oc.rejectQuestion(reqId).catch(() => {});
+        await manager.get(ask?.repo || activeRepoName()).rejectQuestion(reqId).catch(() => {});
         await ctx.editMessageText("🚫 Question skipped.").catch(() => {});
         await ctx.answerCallbackQuery({ text: "Skipped" });
       } else {
@@ -370,7 +654,7 @@ function registerMessages() {
       openQuestion.answers[qi] = text;
       if (openQuestion.answers.every((x) => x !== null)) {
         try {
-          await oc.replyQuestion(openQuestion.reqId, openQuestion.answers);
+          await manager.get(openQuestion.repo).replyQuestion(openQuestion.reqId, openQuestion.answers);
           pendingAsks.delete(openQuestion.reqId);
           await push(chatId, `📩 Answer sent: <b>${esc(text.slice(0, 100))}</b>`);
         } catch (e) {
@@ -383,17 +667,72 @@ function registerMessages() {
       return;
     }
 
-    await sendPrompt(chatId, text);
+    await sendPrompt(chatId, [{ type: "text", text }]);
+  });
+}
+
+async function handleIncomingFile(ctx, fileId, mime, name, caption) {
+  const chatId = ctx.chat.id;
+  try {
+    const { buffer } = await media.downloadTelegramFile(TOKEN, fileId);
+    if (buffer.length > media.MAX_BYTES) {
+      await push(chatId, "⚠️ File too large (10MB limit).");
+      return;
+    }
+    const kb = `${(buffer.length / 1024).toFixed(0)} KB`;
+    if (mime.startsWith("image/")) {
+      await sendPrompt(chatId, [
+        { type: "file", mime, filename: name, url: media.toDataUri(buffer, mime) },
+        { type: "text", text: caption || "User sent this image without a caption — look at it and respond." }
+      ]);
+      await push(chatId, `📎 <b>${esc(name)}</b> (${kb}) sent`);
+    } else {
+      const repo = activeRepoName();
+      const saved = media.saveToWorkspace(manager.get(repo).dir, name, buffer);
+      await sendPrompt(chatId, [
+        { type: "text", text: `${caption ? caption + "\n\n" : ""}A file was saved to: ${saved}` }
+      ]);
+      await push(chatId, `📎 <b>${esc(name)}</b> (${kb}) saved to <code>${esc(saved)}</code>`);
+    }
+  } catch (e) {
+    await push(chatId, `⚠️ File handling failed: ${esc(e.message)}`);
+  }
+}
+
+function registerMedia() {
+  bot.on("message:photo", async (ctx) => {
+    const photos = ctx.message.photo;
+    const best = photos[photos.length - 1];
+    await handleIncomingFile(ctx, best.file_id, "image/jpeg", `photo-${Date.now()}.jpg`, ctx.message.caption);
+  });
+
+  bot.on("message:document", async (ctx) => {
+    const d = ctx.message.document;
+    await handleIncomingFile(ctx, d.file_id, d.mime_type || "application/octet-stream", d.file_name || `file-${Date.now()}`, ctx.message.caption);
+  });
+
+  bot.on("message:voice", async (ctx) => {
+    await push(ctx.chat.id, "🎙 Voice not configured yet — add STT_API_KEY to .env to enable it.");
+  });
+
+  bot.on("message:audio", async (ctx) => {
+    await push(ctx.chat.id, "🎙 Audio not configured yet — add STT_API_KEY to .env to enable it.");
   });
 }
 
 async function main() {
   state.load();
-  state.set({ ownerId: Number(OWNER) });
 
-  const { health, adopted } = await oc.ensureServer();
-  oc.startWatchdog();
-  console.log(`[bridge] opencode ${health.version} at ${oc.BASE} (${adopted ? "adopted" : "spawned"})`);
+  manager = new ServerManager(PASSWORD);
+  for (const [name, r] of Object.entries(state.get().repos)) {
+    manager.register(name, r.dir, r.port);
+  }
+  await manager.ensureAll();
+  manager.startWatchdog();
+  for (const [name, inst] of manager.instances) {
+    console.log(`[bridge] opencode[${name}] ${inst.adopted ? "adopted" : "spawned"} at ${inst.base} (${inst.dir})`);
+    inst.watchEvents(handleEvent(name));
+  }
 
   bot = new Bot(TOKEN);
   bot.catch((err) => console.error("[tg] bot error:", err.error?.message || err.message));
@@ -401,6 +740,7 @@ async function main() {
   registerCommands();
   registerCallbacks();
   registerMessages();
+  registerMedia();
 
   await bot.init();
   await bot.api.setMyCommands([
@@ -408,19 +748,26 @@ async function main() {
     { command: "sessions", description: "List recent sessions" },
     { command: "switch", description: "Switch to session n" },
     { command: "abort", description: "Stop the current task" },
-    { command: "pending", description: "Show pending approvals/questions" },
+    { command: "repo", description: "List / switch / add repos" },
+    { command: "model", description: "Show or set the model" },
+    { command: "agent", description: "Show or set the agent" },
+    { command: "diff", description: "Session file changes" },
+    { command: "todos", description: "Session todo list" },
+    { command: "cost", description: "Session tokens and cost" },
+    { command: "share", description: "Get share URL" },
+    { command: "revert", description: "Undo last turn" },
+    { command: "pending", description: "Pending approvals/questions" },
     { command: "status", description: "Bridge status" },
     { command: "help", description: "How to use" }
   ]);
 
-  oc.watchEvents(handleEvent);
-
-  await push(ownerChat(), `✅ TeleCode bridge is running.\nopencode <code>${esc(health.version)}</code> — workspace <code>${esc(process.env.WORKSPACE_DIR)}</code>\n\nType anything to start a session, or /help.`);
+  await push(
+    ownerChat(),
+    `✅ TeleCode v2 is running.\nrepo: <b>${esc(activeRepoName())}</b> · streaming on · ${manager.instances.size} server${manager.instances.size === 1 ? "" : "s"}\n\nNew: /repo /model /agent /diff /todos /cost /share /revert — photos work too. /help for all.`
+  );
   await announcePending();
 
-  await bot.start({
-    onStart: () => console.log("[bridge] telegram polling started")
-  });
+  await bot.start({ onStart: () => console.log("[bridge] telegram polling started") });
 }
 
 process.on("SIGINT", () => process.exit(0));

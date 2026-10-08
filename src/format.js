@@ -1,7 +1,7 @@
 const LIMIT = 3900;
 
 function esc(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function mdToHtml(md) {
@@ -35,4 +35,39 @@ function splitHtml(html) {
   return parts;
 }
 
-module.exports = { mdToHtml, splitHtml, esc };
+const STATUS_ICON = { added: "🟢", modified: "🟡", deleted: "🔴" };
+const TODO_ICON = { pending: "⬜", in_progress: "🔵", completed: "✅", cancelled: "🚫" };
+
+function fmtDiff(diffs, maxFiles = 30) {
+  if (!Array.isArray(diffs) || !diffs.length) return "No file changes in this session.";
+  let add = 0;
+  let del = 0;
+  const lines = diffs.slice(0, maxFiles).map((d) => {
+    add += d.additions || 0;
+    del += d.deletions || 0;
+    return `${STATUS_ICON[d.status] || "•"} ${esc(d.path)}  <b>+${d.additions || 0}</b> −${d.deletions || 0}`;
+  });
+  if (diffs.length > maxFiles) lines.push(`… and ${diffs.length - maxFiles} more files`);
+  lines.push("", `<b>Total: +${add} −${del} across ${diffs.length} file${diffs.length === 1 ? "" : "s"}</b>`);
+  return lines.join("\n");
+}
+
+function fmtTodos(todos) {
+  if (!Array.isArray(todos) || !todos.length) return "No todos in this session.";
+  return todos
+    .map((t) => `${TODO_ICON[t.status] || "⬜"} ${esc(t.content)} <i>(${esc(t.priority || "medium")})</i>`)
+    .join("\n");
+}
+
+function fmtCost(s) {
+  if (!s) return "Session not found.";
+  const t = s.tokens || {};
+  const c = s.cost || 0;
+  return [
+    `💰 Cost: <b>$${c.toFixed(4)}</b>`,
+    `tokens: ${t.input || 0} in / ${t.output || 0} out / ${t.reasoning || 0} reasoning`,
+    `cache: ${t.cache?.read || 0} read / ${t.cache?.write || 0} write`
+  ].join("\n");
+}
+
+module.exports = { mdToHtml, splitHtml, esc, fmtDiff, fmtTodos, fmtCost };
