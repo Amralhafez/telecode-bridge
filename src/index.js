@@ -82,7 +82,7 @@ async function sendPrompt(chatId, parts, opts = {}) {
   } catch (e) {
     await view.finalize("");
     turnViews.delete(turnKey(repo, sid));
-    await push(chatId, `⚠️ Could not send: <code>${esc(e.message)}</code>\nSession may be busy — /abort to stop it.`);
+    await push(chatId, `⚠️ Could not send: <code>${esc(e.message)}</code>\nSession may be busy — /abort to stop it. If it asked you something, answer the question buttons or /pending.`);
     return;
   }
   expectingTurn.add(turnKey(repo, sid));
@@ -90,6 +90,7 @@ async function sendPrompt(chatId, parts, opts = {}) {
 
 async function onPermissionAsked(repo, p) {
   if (pendingAsks.has(p.id)) return;
+  console.log(`[ask] permission registered: ${p.id} repo=${repo} tool=${p.permission}`);
   const what = p.metadata?.command || (p.patterns || []).join(", ") || p.permission;
   const repoTag = Object.keys(state.get().repos).length > 1 ? `[${repo}] ` : "";
   const html = `${repoTag}🔐 <b>Permission needed</b>\ntool: <code>${esc(p.permission)}</code>\n<code>${esc(what)}</code>`;
@@ -110,6 +111,7 @@ function questionText(q) {
 
 async function onQuestionAsked(repo, p) {
   if (pendingAsks.has(p.id)) return;
+  console.log(`[ask] question registered: ${p.id} repo=${repo}`);
   const ask = {
     kind: "question",
     reqId: p.id,
@@ -279,11 +281,61 @@ const POLICY = {
   }
 };
 
+async function rebuildAskFromServer(reqId) {
+  for (const [name, inst] of manager.instances) {
+    try {
+      const q = (await inst.pendingQuestions()).find((x) => x.id === reqId);
+      if (q) {
+        const ask = {
+          kind: "question",
+          reqId: q.id,
+          repo: name,
+          chatId: ownerChat(),
+          questions: q.questions,
+          answers: q.questions.map(() => null),
+          messageIds: []
+        };
+        pendingAsks.set(reqId, ask);
+        console.log(`[ask] rebuilt from server: ${reqId}`);
+        return ask;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function serverPendingCount() {
+  let n = 0;
+  for (const [, inst] of manager.instances) {
+    try {
+      n += (await inst.pendingQuestions()).length;
+    } catch {}
+  }
+  return n;
+}
+
+async function findFirstServerQuestion() {
+  for (const [name, inst] of manager.instances) {
+    try {
+      const qs = await inst.pendingQuestions();
+      if (qs.length) return qs[0].id;
+    } catch {}
+  }
+  return null;
+}
+
+async function submitAnswers(ask) {
+  await manager.get(ask.repo).replyQuestion(ask.reqId, ask.answers);
+  pendingAsks.delete(ask.reqId);
+  console.log(`[ask] submitted answers for ${ask.reqId}: ${JSON.stringify(ask.answers)}`);
+}
+
 function ownerOnly() {
   return async (ctx, next) => {
     const uid = ctx.from?.id;
     if (uid === undefined || String(uid) !== OWNER) return;
     if (ctx.chat && state.get().chatId !== ctx.chat.id) state.set({ chatId: ctx.chat.id });
+    console.log(`[tg] update: ${ctx.updateType}${ctx.callbackQuery ? " " + (ctx.callbackQuery.data || "") : ctx.message?.text ? ` "${ctx.message.text.slice(0, 50)}"` : ""}`);
     await next();
   };
 }
@@ -598,17 +650,21 @@ function registerCallbacks() {
     try {
       if (data.startsWith("p|")) {
         const [, reqId, choice] = data.split("|");
+        console.log(`[cb] permission answer: ${data}`);
         const ask = pendingAsks.get(reqId);
         await manager.get(ask?.repo || activeRepoName()).replyPermission(reqId, choice);
+        pendingAsks.delete(reqId);
+        console.log(`[ask] permission ${choice} submitted for ${reqId}`);
         const label = choice === "once" ? "approved (once)" : choice === "always" ? "approved (always)" : "denied";
         await ctx.editMessageText(`${choice === "reject" ? "❌" : "✅"} Permission ${label}.`).catch(() => {});
-        pendingAsks.delete(reqId);
         await ctx.answerCallbackQuery({ text: `Permission ${choice}` });
       } else if (data.startsWith("q|")) {
         const [, reqId, qi, oi] = data.split("|");
-        const ask = pendingAsks.get(reqId);
+        console.log(`[cb] question answer: ${data}`);
+        let ask = pendingAsks.get(reqId);
+        if (!ask) ask = await rebuildAskFromServer(reqId);
         if (!ask) {
-          await ctx.answerCallbackQuery({ text: "Already answered" });
+          await ctx.answerCallbackQuery({ text: "Question no longer pending" });
           return;
         }
         const q = ask.questions[Number(qi)];
@@ -616,8 +672,7 @@ function registerCallbacks() {
         ask.answers[Number(qi)] = label;
         await ctx.editMessageText(`✔️ ${esc(label)}`).catch(() => {});
         if (ask.answers.every((a) => a !== null)) {
-          await manager.get(ask.repo).replyQuestion(reqId, ask.answers);
-          pendingAsks.delete(reqId);
+          await submitAnswers(ask);
           await ctx.answerCallbackQuery({ text: "Answer sent" });
         } else {
           const done = ask.answers.filter((a) => a !== null).length;
@@ -625,12 +680,14 @@ function registerCallbacks() {
         }
       } else if (data.startsWith("qrej|")) {
         const [, reqId] = data.split("|");
+        console.log(`[cb] question skip: ${data}`);
         const ask = pendingAsks.get(reqId);
         pendingAsks.delete(reqId);
         await manager.get(ask?.repo || activeRepoName()).rejectQuestion(reqId).catch(() => {});
         await ctx.editMessageText("🚫 Question skipped.").catch(() => {});
         await ctx.answerCallbackQuery({ text: "Skipped" });
       } else {
+        console.log(`[cb] unknown: ${data}`);
         await ctx.answerCallbackQuery();
       }
     } catch (e) {
@@ -649,20 +706,32 @@ function registerMessages() {
     const openQuestion = [...pendingAsks.values()].find(
       (a) => a.kind === "question" && a.chatId === chatId && a.answers.some((x) => x === null)
     );
-    if (openQuestion) {
-      const qi = openQuestion.answers.findIndex((x) => x === null);
-      openQuestion.answers[qi] = text;
-      if (openQuestion.answers.every((x) => x !== null)) {
+    let target = openQuestion;
+    if (!target) {
+      const count = await serverPendingCount();
+      if (count === 1) {
+        const rid = await findFirstServerQuestion();
+        if (rid) target = await rebuildAskFromServer(rid);
+      } else if (count > 1) {
+        await announcePending();
+        await push(chatId, "❓ Multiple pending questions — answer them via the buttons above first.");
+        return;
+      }
+    }
+    if (target) {
+      const ask = target;
+      const qi = ask.answers.findIndex((x) => x === null);
+      ask.answers[qi] = text;
+      if (ask.answers.every((x) => x !== null)) {
         try {
-          await manager.get(openQuestion.repo).replyQuestion(openQuestion.reqId, openQuestion.answers);
-          pendingAsks.delete(openQuestion.reqId);
+          await submitAnswers(ask);
           await push(chatId, `📩 Answer sent: <b>${esc(text.slice(0, 100))}</b>`);
         } catch (e) {
           await push(chatId, `⚠️ Could not submit answer: ${esc(e.message)}`);
         }
       } else {
-        const done = openQuestion.answers.filter((x) => x !== null).length;
-        await push(chatId, `📩 Saved (${done}/${openQuestion.answers.length}) — tap an option or type for the rest.`);
+        const done = ask.answers.filter((x) => x !== null).length;
+        await push(chatId, `📩 Saved (${done}/${ask.answers.length}) — tap an option or type for the rest.`);
       }
       return;
     }
