@@ -16,6 +16,24 @@ if (!TOKEN || !OWNER) {
   process.exit(1);
 }
 
+const lockFile = path.join(__dirname, "..", "bridge.lock");
+try {
+  const prev = parseInt(fs.readFileSync(lockFile, "utf8"), 10);
+  if (prev && prev !== process.pid) {
+    try {
+      process.kill(prev, 0);
+      console.error(`[bridge] already running as PID ${prev} — exiting`);
+      process.exit(0);
+    } catch {}
+  }
+} catch {}
+fs.writeFileSync(lockFile, String(process.pid));
+process.on("exit", () => {
+  try {
+    if (fs.readFileSync(lockFile, "utf8") === String(process.pid)) fs.unlinkSync(lockFile);
+  } catch {}
+});
+
 const sentMessages = new Set();
 const toolSeen = new Set();
 const expectingTurn = new Set();
