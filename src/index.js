@@ -421,7 +421,7 @@ function registerCommands() {
     "/repo add &lt;name&gt; &lt;path&gt; — add a repo",
     "/repo remove &lt;name&gt;",
     "/model [provider/model | list &lt;q&gt;]",
-    "/agent [name]",
+    "/agent [name] · /mode — plan/build toggle",
     "/diff · /todos · /cost · /share · /revert",
     "/pending — un-answered approvals · /status"
   ].join("\n");
@@ -586,6 +586,20 @@ function registerCommands() {
     await push(ctx.chat.id, `🧠 [${esc(repo)}] Model set: <b>${esc(arg)}</b>`);
   });
 
+  bot.command("mode", async (ctx) => {
+    const repo = activeRepoName();
+    let names = ["build", "plan"];
+    try {
+      const agents = await manager.get(repo).api("GET", "/agent");
+      const top = agents.filter((a) => a.mode !== "subagent").map((a) => a.name);
+      if (top.length) names = top;
+    } catch {}
+    const cur = state.get().activeAgents[repo] || names[0] || "build";
+    const kb = new InlineKeyboard();
+    for (const n of names.slice(0, 8)) kb.text(n === cur ? `● ${n} (current)` : n, `m|${n}`).row();
+    await push(ctx.chat.id, `🎛 [${esc(repo)}] agent: <b>${esc(cur)}</b>\n${cur === "plan" ? "Plane mode: read-only, no edits." : "Build mode: full edit + run powers."}\nTap to switch:`, { reply_markup: kb });
+  });
+
   bot.command("agent", async (ctx) => {
     const repo = activeRepoName();
     const inst = manager.get(repo);
@@ -696,6 +710,13 @@ function registerCallbacks() {
         const label = choice === "once" ? "approved (once)" : choice === "always" ? "approved (always)" : "denied";
         await ctx.editMessageText(`${choice === "reject" ? "❌" : "✅"} Permission ${label}.`).catch(() => {});
         await ctx.answerCallbackQuery({ text: `Permission ${choice}` });
+      } else if (data.startsWith("m|")) {
+        const [, name] = data.split("|");
+        console.log(`[cb] mode switch: ${data}`);
+        const repo = activeRepoName();
+        state.set({ activeAgents: { ...state.get().activeAgents, [repo]: name } });
+        await ctx.editMessageText(`🎛 [${esc(repo)}] agent switched to <b>${esc(name)}</b>${name === "plan" ? " (read-only)" : ""}`).catch(() => {});
+        await ctx.answerCallbackQuery({ text: `Agent: ${name}` });
       } else if (data.startsWith("q|")) {
         const [, reqId, qi, oi] = data.split("|");
         console.log(`[cb] question answer: ${data}`);
@@ -858,6 +879,7 @@ async function main() {
     { command: "abort", description: "Stop the current task" },
     { command: "repo", description: "List / switch / add repos" },
     { command: "model", description: "Show or set the model" },
+    { command: "mode", description: "Switch plan / build mode" },
     { command: "agent", description: "Show or set the agent" },
     { command: "diff", description: "Session file changes" },
     { command: "todos", description: "Session todo list" },
