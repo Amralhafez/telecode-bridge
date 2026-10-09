@@ -1,0 +1,18 @@
+services:
+  telecode-bridge:
+    build: .
+    container_name: telecode-bridge
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Inside the container the workspace is always mounted at /workspace.
+      WORKSPACE_DIR: /workspace
+    volumes:
+      # Your project to work on — change the left side to your project path.
+      - ./workspace:/workspace
+      # Persist bridge state and logs across restarts.
+      - ./state.json:/app/state.json
+      - ./logs:/app/logs
+      # Reuse the opencode auth/credentials from your host (optional but
+      # usually needed so the model provider is already logged in).
+      - ${HOME}/.local/share/opencode:/root/.local/share/opencode

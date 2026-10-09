@@ -1,11 +1,32 @@
 {
   "name": "telecode-bridge",
   "version": "1.0.0",
-  "description": "Telegram bridge for opencode sessions",
+  "description": "Drive opencode coding sessions from Telegram — streamed replies, approvals, questions, multi-repo, and file uploads.",
   "type": "commonjs",
   "main": "src/index.js",
+  "bin": {
+    "telecode-bridge": "src/index.js"
+  },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "setup": "node scripts/setup.js",
+    "watchdog": "node watchdog.js"
+  },
+  "keywords": [
+    "opencode",
+    "telegram",
+    "bot",
+    "ai",
+    "coding-agent",
+    "bridge"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/telecode-bridge.git"
   },
   "dependencies": {
     "dotenv": "^17.2.3",

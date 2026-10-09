@@ -2,7 +2,12 @@ const fs = require("fs");
 const path = require("path");
 
 const FILE = path.join(__dirname, "..", "state.json");
-const DEFAULT_WORKSPACE = process.env.WORKSPACE_DIR || "C:\\Users\\you\\TeleCode";
+// Workspace to operate on by default. Set WORKSPACE_DIR in .env; otherwise
+// fall back to the directory the bridge was started from. No OS-specific paths.
+const DEFAULT_WORKSPACE = process.env.WORKSPACE_DIR || process.cwd();
+// Internal label for the default repo, derived from the workspace folder name.
+const DEFAULT_REPO =
+  (path.basename(DEFAULT_WORKSPACE) || "workspace").toLowerCase().replace(/[^a-z0-9-]/g, "") || "workspace";
 
 const defaults = {
   ownerId: null,
@@ -19,9 +24,9 @@ let state = { ...defaults };
 
 function migrate(data) {
   if (data.activeSessionId && !data.repos) {
-    data.repos = { telecode: { dir: DEFAULT_WORKSPACE, port: 4096 } };
-    data.activeRepo = "telecode";
-    data.activeSessions = { telecode: data.activeSessionId };
+    data.repos = { [DEFAULT_REPO]: { dir: DEFAULT_WORKSPACE, port: 4096 } };
+    data.activeRepo = DEFAULT_REPO;
+    data.activeSessions = { [DEFAULT_REPO]: data.activeSessionId };
     data.lastSessionLists = {};
     data.activeModels = {};
     data.activeAgents = {};
@@ -34,7 +39,7 @@ function migrate(data) {
   data.activeModels = data.activeModels || {};
   data.activeAgents = data.activeAgents || {};
   if (!Object.keys(data.repos).length) {
-    data.repos.telecode = { dir: DEFAULT_WORKSPACE, port: 4096 };
+    data.repos[DEFAULT_REPO] = { dir: DEFAULT_WORKSPACE, port: 4096 };
     delete data.activeSessionId;
   }
   if (!data.activeRepo || !data.repos[data.activeRepo]) {

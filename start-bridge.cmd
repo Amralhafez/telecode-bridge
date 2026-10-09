@@ -1,3 +1,5 @@
 @echo off
-cd /d "C:\Users\you\telecode-bridge"
-"C:\nvm4w2\nodejs\node.exe" src\index.js >> logs\bridge-task.log 2>&1
+REM Windows launcher — runs from this script's own folder, uses node from PATH.
+cd /d "%~dp0"
+if not exist logs mkdir logs
+node src\index.js >> logs\bridge-task.log 2>&1
