@@ -86,7 +86,7 @@ async function startNewSession(chatId, text, { runAsPrompt = false } = {}) {
   const repo = activeRepoName();
   const inst = manager.get(repo);
   if (!inst) {
-    await push(chatId, "⚠️ ما في ريبو فعّال — استخدم /repo أول.");
+    await push(chatId, "⚠️ No active repo — use /repo first.");
     return null;
   }
   const title = (text && text.trim() ? text.trim() : `tg ${new Date().toISOString().slice(0, 16)}`).slice(0, 80);
@@ -94,11 +94,11 @@ async function startNewSession(chatId, text, { runAsPrompt = false } = {}) {
   try {
     s = await inst.createSession(title);
   } catch (e) {
-    await push(chatId, `⚠️ ما قدرت أفتح جلسة: <code>${esc(e.message)}</code>`);
+    await push(chatId, `⚠️ Could not create a session: <code>${esc(e.message)}</code>`);
     return null;
   }
   state.set({ activeSessions: { ...state.get().activeSessions, [repo]: s.id } });
-  await push(chatId, `🆕 [${esc(repo)}] جلسة جديدة: <b>${esc(title)}</b>\n<code>${esc(s.id)}</code>`);
+  await push(chatId, `🆕 [${esc(repo)}] New session: <b>${esc(title)}</b>\n<code>${esc(s.id)}</code>`);
   if (runAsPrompt && text && text.trim()) await sendPrompt(chatId, [{ type: "text", text: text.trim() }]);
   return s;
 }
@@ -431,7 +431,7 @@ async function sessionsList(chatId) {
     (s, i) => `${s.id === active ? "▶️" : `<b>${i + 1}.</b>`} ${esc((s.title || "untitled").slice(0, 60))}\n      <i>${esc(s.id)}</i>`
   );
   if (!sessions.length) {
-    await push(chatId, `<b>repo: ${esc(repo)}</b>\n\nما في جلسات بعد — ابعت رسالة أو /new`);
+    await push(chatId, `<b>repo: ${esc(repo)}</b>\n\nNo sessions yet — send a message or /new`);
     return;
   }
   const kb = new InlineKeyboard();
@@ -439,7 +439,7 @@ async function sessionsList(chatId) {
     kb.text(`${s.id === active ? "▶️" : ""}${i + 1}`, `sw|${i}`);
     if (i % 5 === 4) kb.row();
   });
-  await push(chatId, `<b>repo: ${esc(repo)}</b>\n\n${lines.join("\n")}\n\n<i>اكبس الرقم للتبديل:</i>`, { reply_markup: kb });
+  await push(chatId, `<b>repo: ${esc(repo)}</b>\n\n${lines.join("\n")}\n\n<i>Tap a number to switch:</i>`, { reply_markup: kb });
 }
 
 async function modelsList(inst, query) {
@@ -484,7 +484,7 @@ function registerCommands() {
       pendingInput.set(ctx.chat.id, { type: "new_session" });
       await push(
         ctx.chat.id,
-        "🆕 <b>جلسة جديدة</b>\nاكتب شو بدك تعمل (أو اسم للجلسة) ومنبلّش فوراً 👇\n\n<i>/cancel للإلغاء.</i>"
+        "🆕 <b>New session</b>\nTell me what you want to do (or a name for the session) and we'll start right away 👇\n\n<i>/cancel to abort.</i>"
       );
       return;
     }
@@ -492,8 +492,8 @@ function registerCommands() {
   });
 
   bot.command("cancel", async (ctx) => {
-    if (pendingInput.delete(ctx.chat.id)) await push(ctx.chat.id, "✖️ تم الإلغاء.");
-    else await push(ctx.chat.id, "ما في شي معلّق لإلغائه.");
+    if (pendingInput.delete(ctx.chat.id)) await push(ctx.chat.id, "✖️ Cancelled.");
+    else await push(ctx.chat.id, "Nothing pending to cancel.");
   });
 
   bot.command("sessions", async (ctx) => sessionsList(ctx.chat.id));
@@ -783,12 +783,12 @@ function registerCallbacks() {
         const list = state.get().lastSessionLists[repo] || [];
         const sid = list[Number(idx)];
         if (!sid) {
-          await ctx.answerCallbackQuery({ text: "الجلسة ما عادت موجودة — /sessions" });
+          await ctx.answerCallbackQuery({ text: "Session no longer listed — /sessions" });
           return;
         }
         state.set({ activeSessions: { ...state.get().activeSessions, [repo]: sid } });
-        await ctx.editMessageText(`🔄 [${esc(repo)}] تم التبديل للجلسة #${Number(idx) + 1}\n<code>${esc(sid)}</code>`, { parse_mode: "HTML" }).catch(() => {});
-        await ctx.answerCallbackQuery({ text: "تم التبديل ✅" });
+        await ctx.editMessageText(`🔄 [${esc(repo)}] Switched to session #${Number(idx) + 1}\n<code>${esc(sid)}</code>`, { parse_mode: "HTML" }).catch(() => {});
+        await ctx.answerCallbackQuery({ text: "Switched ✅" });
       } else if (data.startsWith("q|")) {
         const [, reqId, qi, oi] = data.split("|");
         console.log(`[cb] question answer: ${data}`);
