@@ -464,7 +464,7 @@ function ownerOnly() {
   };
 }
 
-async function sessionsList(chatId) {
+async function sessionsView() {
   const repo = activeRepoName();
   const inst = manager.get(repo);
   const sessions = (await inst.listSessions())
@@ -473,19 +473,25 @@ async function sessionsList(chatId) {
     .slice(0, 15);
   state.set({ lastSessionLists: { ...state.get().lastSessionLists, [repo]: sessions.map((s) => s.id) } });
   const active = state.get().activeSessions[repo];
+  const kb = new InlineKeyboard();
+  if (!sessions.length) {
+    kb.text("⬅️ Menu", "mn|home");
+    return { html: `<b>repo: ${esc(repo)}</b>\n\nNo sessions yet — send a message or /new`, kb };
+  }
   const lines = sessions.map(
     (s, i) => `${s.id === active ? "▶️" : `<b>${i + 1}.</b>`} ${esc((s.title || "untitled").slice(0, 60))}\n      <i>${esc(s.id)}</i>`
   );
-  if (!sessions.length) {
-    await push(chatId, `<b>repo: ${esc(repo)}</b>\n\nNo sessions yet — send a message or /new`);
-    return;
-  }
-  const kb = new InlineKeyboard();
   sessions.forEach((s, i) => {
     kb.text(`${s.id === active ? "▶️" : ""}${i + 1}`, `sw|${i}`);
     if (i % 5 === 4) kb.row();
   });
-  await push(chatId, `<b>repo: ${esc(repo)}</b>\n\n${lines.join("\n")}\n\n<i>Tap a number to switch:</i>`, { reply_markup: kb });
+  kb.row().text("⬅️ Menu", "mn|home");
+  return { html: `<b>repo: ${esc(repo)}</b>\n\n${lines.join("\n")}\n\n<i>Tap a number to switch:</i>`, kb };
+}
+
+async function sessionsList(chatId) {
+  const v = await sessionsView();
+  await push(chatId, v.html, { reply_markup: v.kb });
 }
 
 async function modelsList(inst, query) {
@@ -543,20 +549,46 @@ function menuKeyboard() {
     .text("❓ Help", "mn|help");
 }
 
+// A keyboard with just a Back-to-menu button (used by sub-panels).
+function backKb() {
+  return new InlineKeyboard().text("⬅️ Menu", "mn|home");
+}
+
+function menuView() {
+  return {
+    html: "<b>TeleCode — menu</b>\nTap an action, or just type a message to prompt the active session.",
+    kb: menuKeyboard()
+  };
+}
+
+// Edit the message a callback button is attached to; fall back to a fresh
+// message if the edit fails (e.g. the message is too old or unchanged).
+async function showView(ctx, view) {
+  try {
+    await ctx.editMessageText(view.html, { parse_mode: "HTML", reply_markup: view.kb });
+  } catch (e) {
+    if (!String(e.message || "").includes("not modified")) {
+      await push(ctx.chat.id, view.html, { reply_markup: view.kb });
+    }
+  }
+}
+
 async function sendMenu(chatId) {
-  await push(
-    chatId,
-    "<b>TeleCode — menu</b>\nTap an action, or just type a message to prompt the active session.",
-    { reply_markup: menuKeyboard() }
-  );
+  const v = menuView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+
+function newSessionView() {
+  return {
+    html: "🆕 <b>New session</b>\nTell me what you want to do (or a name for the session) and we'll start right away 👇\n\n<i>/cancel to abort.</i>",
+    kb: backKb()
+  };
 }
 
 async function askNewSession(chatId) {
   pendingInput.set(chatId, { type: "new_session" });
-  await push(
-    chatId,
-    "🆕 <b>New session</b>\nTell me what you want to do (or a name for the session) and we'll start right away 👇\n\n<i>/cancel to abort.</i>"
-  );
+  const v = newSessionView();
+  await push(chatId, v.html, { reply_markup: v.kb });
 }
 
 async function doAbort(chatId) {
@@ -575,31 +607,31 @@ async function doAbort(chatId) {
   }
 }
 
-async function doDiff(chatId) {
+async function diffView() {
   const repo = activeRepoName();
   const sid = state.get().activeSessions[repo];
-  if (!sid) return push(chatId, "No active session.");
+  if (!sid) return { html: "No active session.", kb: backKb() };
   const diffs = await manager.get(repo).sessionDiff(sid);
-  await push(chatId, `<b>[${esc(repo)}] Diff</b>\n${fmtDiff(diffs)}`);
+  return { html: `<b>[${esc(repo)}] Diff</b>\n${fmtDiff(diffs)}`, kb: backKb() };
 }
 
-async function doTodos(chatId) {
+async function todosView() {
   const repo = activeRepoName();
   const sid = state.get().activeSessions[repo];
-  if (!sid) return push(chatId, "No active session.");
+  if (!sid) return { html: "No active session.", kb: backKb() };
   const todos = await manager.get(repo).sessionTodo(sid);
-  await push(chatId, `<b>[${esc(repo)}] Todos</b>\n${fmtTodos(todos)}`);
+  return { html: `<b>[${esc(repo)}] Todos</b>\n${fmtTodos(todos)}`, kb: backKb() };
 }
 
-async function doCost(chatId) {
+async function costView() {
   const repo = activeRepoName();
   const sid = state.get().activeSessions[repo];
-  if (!sid) return push(chatId, "No active session.");
+  if (!sid) return { html: "No active session.", kb: backKb() };
   const s = await manager.get(repo).sessionDetail(sid);
-  await push(chatId, `<b>[${esc(repo)}]</b> ${esc((s.title || "").slice(0, 50))}\n${fmtCost(s)}`);
+  return { html: `<b>[${esc(repo)}]</b> ${esc((s.title || "").slice(0, 50))}\n${fmtCost(s)}`, kb: backKb() };
 }
 
-async function doMode(chatId) {
+async function modeView() {
   const repo = activeRepoName();
   let names = ["build", "plan"];
   try {
@@ -610,31 +642,31 @@ async function doMode(chatId) {
   const cur = state.get().activeAgents[repo] || names[0] || "build";
   const kb = new InlineKeyboard();
   for (const n of names.slice(0, 8)) kb.text(n === cur ? `● ${n} (current)` : n, `m|${n}`).row();
-  await push(
-    chatId,
-    `🎛 [${esc(repo)}] agent: <b>${esc(cur)}</b>\n${cur === "plan" ? "Plan mode: read-only, no edits." : "Build mode: full edit + run powers."}\nTap to switch:`,
-    { reply_markup: kb }
-  );
+  kb.text("⬅️ Menu", "mn|home");
+  return {
+    html: `🎛 [${esc(repo)}] agent: <b>${esc(cur)}</b>\n${cur === "plan" ? "Plan mode: read-only, no edits." : "Build mode: full edit + run powers."}\nTap to switch:`,
+    kb
+  };
 }
 
-async function doModelInfo(chatId) {
+function modelView() {
   const repo = activeRepoName();
   const cur = state.get().activeModels[repo] || "(provider default)";
-  await push(
-    chatId,
-    `🧠 [${esc(repo)}] model: <b>${esc(cur)}</b>\n/model list [query] — browse\n/model provider/model — set\n/model clear — reset`
-  );
+  return {
+    html: `🧠 [${esc(repo)}] model: <b>${esc(cur)}</b>\n/model list [query] — browse\n/model provider/model — set\n/model clear — reset`,
+    kb: backKb()
+  };
 }
 
-async function doRepoList(chatId) {
+function reposView() {
   const repos = state.get().repos;
   const lines = Object.entries(repos).map(([name, r]) =>
     `${name === state.get().activeRepo ? "▶️" : "•"} <b>${esc(name)}</b> — <code>${esc(r.dir)}</code> :${r.port}`
   );
-  await push(chatId, `<b>Repos</b>\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`);
+  return { html: `<b>Repos</b>\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`, kb: backKb() };
 }
 
-async function doStatus(chatId) {
+async function statusView() {
   const repo = activeRepoName();
   const sid = state.get().activeSessions[repo];
   let statusLine = "no active session";
@@ -652,13 +684,58 @@ async function doStatus(chatId) {
   try {
     version = (await manager.get(repo).api("GET", "/global/health")).version;
   } catch {}
-  await push(
-    chatId,
-    `🟢 TeleCode bridge\nopencode: <code>${esc(version)}</code>\nrepo: <b>${esc(repo)}</b>\nsession: ${esc(title)}\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\nmodel: <b>${esc(state.get().activeModels[repo] || "default")}</b>\nagent: <b>${esc(state.get().activeAgents[repo] || "default")}</b>\npending asks: ${pendingAsks.size}`
-  );
+  const yolo = state.get().yolo[repo] ? "ON ⚡" : "off";
+  return {
+    html: `🟢 TeleCode bridge\nopencode: <code>${esc(version)}</code>\nrepo: <b>${esc(repo)}</b>\nsession: ${esc(title)}\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\nmodel: <b>${esc(state.get().activeModels[repo] || "default")}</b>\nagent: <b>${esc(state.get().activeAgents[repo] || "default")}</b>\nyolo: <b>${yolo}</b>\npending asks: ${pendingAsks.size}`,
+    kb: backKb()
+  };
+}
+
+async function doDiff(chatId) {
+  const v = await diffView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+async function doTodos(chatId) {
+  const v = await todosView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+async function doCost(chatId) {
+  const v = await costView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+async function doMode(chatId) {
+  const v = await modeView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+async function doModelInfo(chatId) {
+  const v = modelView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+async function doRepoList(chatId) {
+  const v = reposView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+async function doStatus(chatId) {
+  const v = await statusView();
+  await push(chatId, v.html, { reply_markup: v.kb });
 }
 
 // ── YOLO (auto-approve) ────────────────────────────────────────────────
+function yoloView() {
+  const repo = activeRepoName();
+  const on = !!state.get().yolo[repo];
+  const kb = new InlineKeyboard()
+    .text(on ? "🛡 Turn OFF" : "⚡ Turn ON", "mn|yolotoggle")
+    .row()
+    .text("⬅️ Menu", "mn|home");
+  return {
+    html: on
+      ? `🤖 <b>YOLO — ${esc(repo)}</b>\n⚡ <b>ON</b> — permission requests are auto-approved. Use with care.`
+      : `🤖 <b>YOLO — ${esc(repo)}</b>\n🛡 <b>OFF</b> — you'll be asked to approve each time.`,
+    kb
+  };
+}
+
 async function doYolo(chatId) {
   const repo = activeRepoName();
   const next = !state.get().yolo[repo];
@@ -763,6 +840,32 @@ async function offerGitActions(chatId, { announceClean = false } = {}) {
   await push(chatId, `🔀 <b>${changed.length}</b> uncommitted change(s) in <b>${esc(repo)}</b>.`, { reply_markup: kb });
 }
 
+// Git panel for the menu (always returns a view, with a Back button).
+async function gitView() {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  const kb = new InlineKeyboard();
+  if (!dir || !(await git.isRepo(dir))) {
+    kb.text("⬅️ Menu", "mn|home");
+    return { html: `🔀 <b>Git — ${esc(repo)}</b>\n⚠️ Not a git repository.`, kb };
+  }
+  let changed = [];
+  try {
+    changed = await git.changes(dir);
+  } catch {}
+  if (changed.length) {
+    kb.text("📥 Commit & push", "git|commitpush").text("🔁 Diff", "git|diff").row();
+    kb.text("📄 Diff file", "git|difffile").text("⏪ Revert turn", "git|revert").row();
+  }
+  kb.text("⬅️ Menu", "mn|home");
+  return {
+    html: changed.length
+      ? `🔀 <b>Git — ${esc(repo)}</b>\n${changed.length} uncommitted change(s).`
+      : `🔀 <b>Git — ${esc(repo)}</b>\n✅ Working tree clean.`,
+    kb
+  };
+}
+
 // ── Quick-prompt templates ─────────────────────────────────────────────
 const TEMPLATES = {
   tests: { label: "🧪 Run tests", prompt: "Run the test suite and fix any failures." },
@@ -771,27 +874,33 @@ const TEMPLATES = {
   review: { label: "🔎 Review changes", prompt: "Review my uncommitted changes for bugs, security issues, and improvements. Be concise." }
 };
 
-async function doTemplates(chatId) {
+function templatesView() {
   const kb = new InlineKeyboard();
   Object.keys(TEMPLATES).forEach((k, i) => {
     kb.text(TEMPLATES[k].label, `tpl|${k}`);
     if (i % 2 === 1) kb.row();
   });
-  await push(chatId, "<b>Quick prompts</b>\nTap one to run it on the active session:", { reply_markup: kb });
+  kb.row().text("⬅️ Menu", "mn|home");
+  return { html: "<b>Quick prompts</b>\nTap one to run it on the active session:", kb };
+}
+
+async function doTemplates(chatId) {
+  const v = templatesView();
+  await push(chatId, v.html, { reply_markup: v.kb });
 }
 
 // ── File browser ───────────────────────────────────────────────────────
 const lastBrowse = new Map();
 
-async function doFiles(chatId, rel) {
+function filesView(chatId, rel) {
   const repo = activeRepoName();
   const dir = repoDir(repo);
-  if (!dir) return push(chatId, "⚠️ No active repo.");
+  if (!dir) return { html: "⚠️ No active repo.", kb: backKb() };
   let listing;
   try {
     listing = files.list(dir, rel || ".");
   } catch (e) {
-    return push(chatId, `⚠️ ${esc(e.message)}`);
+    return { html: `⚠️ ${esc(e.message)}`, kb: backKb() };
   }
   lastBrowse.set(chatId, listing);
   const kb = new InlineKeyboard();
@@ -804,9 +913,15 @@ async function doFiles(chatId, rel) {
   listing.files.forEach((f, i) => {
     kb.text(`📄 ${f.slice(0, 24)}`, `fb|v|${i}`).text("⬇️", `fb|d|${i}`).row();
   });
+  kb.text("⬅️ Menu", "mn|home");
   const where = listing.rel === "." ? "" : listing.rel;
   const empty = listing.dirs.length + listing.files.length ? "" : "\n<i>(empty)</i>";
-  await push(chatId, `<b>📂 ${esc(repo)}:/${esc(where)}</b>${empty}`, { reply_markup: kb });
+  return { html: `<b>📂 ${esc(repo)}:/${esc(where)}</b>${empty}`, kb };
+}
+
+async function doFiles(chatId, rel) {
+  const v = filesView(chatId, rel || ".");
+  await push(chatId, v.html, { reply_markup: v.kb });
 }
 
 // ── Export transcript ──────────────────────────────────────────────────
@@ -1216,21 +1331,28 @@ function registerCallbacks() {
         const chatId = ctx.chat.id;
         await ctx.answerCallbackQuery().catch(() => {});
         switch (action) {
-          case "new": await askNewSession(chatId); break;
-          case "sessions": await sessionsList(chatId); break;
-          case "status": await doStatus(chatId); break;
-          case "mode": await doMode(chatId); break;
-          case "diff": await doDiff(chatId); break;
-          case "todos": await doTodos(chatId); break;
-          case "cost": await doCost(chatId); break;
-          case "abort": await doAbort(chatId); break;
-          case "model": await doModelInfo(chatId); break;
-          case "repo": await doRepoList(chatId); break;
-          case "git": await offerGitActions(chatId, { announceClean: true }); break;
-          case "templates": await doTemplates(chatId); break;
-          case "files": await doFiles(chatId, "."); break;
-          case "yolo": await doYolo(chatId); break;
-          case "help": await push(chatId, HELP_TEXT); break;
+          case "home": await showView(ctx, menuView()); break;
+          case "new": pendingInput.set(chatId, { type: "new_session" }); await showView(ctx, newSessionView()); break;
+          case "sessions": await showView(ctx, await sessionsView()); break;
+          case "status": await showView(ctx, await statusView()); break;
+          case "mode": await showView(ctx, await modeView()); break;
+          case "diff": await showView(ctx, await diffView()); break;
+          case "todos": await showView(ctx, await todosView()); break;
+          case "cost": await showView(ctx, await costView()); break;
+          case "model": await showView(ctx, modelView()); break;
+          case "repo": await showView(ctx, reposView()); break;
+          case "git": await showView(ctx, await gitView()); break;
+          case "templates": await showView(ctx, templatesView()); break;
+          case "files": await showView(ctx, filesView(chatId, ".")); break;
+          case "yolo": await showView(ctx, yoloView()); break;
+          case "yolotoggle": {
+            const repo = activeRepoName();
+            state.set({ yolo: { ...state.get().yolo, [repo]: !state.get().yolo[repo] } });
+            await showView(ctx, yoloView());
+            break;
+          }
+          case "abort": await doAbort(chatId); await showView(ctx, menuView()); break;
+          case "help": await showView(ctx, { html: HELP_TEXT, kb: backKb() }); break;
           default: break;
         }
         return;
@@ -1270,10 +1392,10 @@ function registerCallbacks() {
         const join = (name) => (b.rel === "." ? "" : b.rel + "/") + name;
         if (act === "up") {
           const parent = b.rel === "." ? "." : b.rel.split("/").slice(0, -1).join("/") || ".";
-          await doFiles(ctx.chat.id, parent);
+          await showView(ctx, filesView(ctx.chat.id, parent));
         } else if (act === "o") {
           const name = b.dirs[Number(iStr)];
-          if (name) await doFiles(ctx.chat.id, join(name));
+          if (name) await showView(ctx, filesView(ctx.chat.id, join(name)));
         } else if (act === "v" || act === "d") {
           const name = b.files[Number(iStr)];
           if (!name) return;
@@ -1308,8 +1430,8 @@ function registerCallbacks() {
         console.log(`[cb] mode switch: ${data}`);
         const repo = activeRepoName();
         state.set({ activeAgents: { ...state.get().activeAgents, [repo]: name } });
-        await ctx.editMessageText(`🎛 [${esc(repo)}] agent switched to <b>${esc(name)}</b>${name === "plan" ? " (read-only)" : ""}`).catch(() => {});
         await ctx.answerCallbackQuery({ text: `Agent: ${name}` });
+        await showView(ctx, await modeView());
       } else if (data.startsWith("sw|")) {
         const [, idx] = data.split("|");
         console.log(`[cb] session switch: ${data}`);
@@ -1321,8 +1443,8 @@ function registerCallbacks() {
           return;
         }
         state.set({ activeSessions: { ...state.get().activeSessions, [repo]: sid } });
-        await ctx.editMessageText(`🔄 [${esc(repo)}] Switched to session #${Number(idx) + 1}\n<code>${esc(sid)}</code>`, { parse_mode: "HTML" }).catch(() => {});
-        await ctx.answerCallbackQuery({ text: "Switched ✅" });
+        await ctx.answerCallbackQuery({ text: `Switched to #${Number(idx) + 1} ✅` });
+        await showView(ctx, await sessionsView());
       } else if (data.startsWith("q|")) {
         const [, reqId, qi, oi] = data.split("|");
         console.log(`[cb] question answer: ${data}`);
