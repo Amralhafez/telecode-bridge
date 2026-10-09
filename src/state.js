@@ -17,7 +17,11 @@ const defaults = {
   activeSessions: {},
   lastSessionLists: {},
   activeModels: {},
-  activeAgents: {}
+  activeAgents: {},
+  yolo: {},
+  schedules: [],
+  allowedUsers: [],
+  budgetLimit: 0
 };
 
 let state = { ...defaults };
@@ -38,6 +42,10 @@ function migrate(data) {
   data.lastSessionLists = data.lastSessionLists || {};
   data.activeModels = data.activeModels || {};
   data.activeAgents = data.activeAgents || {};
+  data.yolo = data.yolo || {};
+  data.schedules = Array.isArray(data.schedules) ? data.schedules : [];
+  data.allowedUsers = Array.isArray(data.allowedUsers) ? data.allowedUsers : [];
+  data.budgetLimit = Number(data.budgetLimit) || 0;
   if (!Object.keys(data.repos).length) {
     data.repos[DEFAULT_REPO] = { dir: DEFAULT_WORKSPACE, port: 4096 };
     delete data.activeSessionId;

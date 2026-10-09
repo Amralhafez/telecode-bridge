@@ -1,12 +1,15 @@
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
-const { Bot, InlineKeyboard } = require("grammy");
+const { Bot, InlineKeyboard, InputFile } = require("grammy");
 const { ServerManager } = require("./oc");
 const state = require("./state");
 const { mdToHtml, splitHtml, esc, fmtDiff, fmtTodos, fmtCost } = require("./format");
 const { TurnView, editSafe } = require("./stream");
 const media = require("./media");
+const stt = require("./stt");
+const git = require("./git");
+const files = require("./files");
 
 const OWNER_ENV = String(process.env.TELEGRAM_OWNER_ID || "");
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
@@ -66,6 +69,19 @@ async function push(chatId, html, extra = {}) {
     }
   }
   return outs;
+}
+
+async function sendDoc(chatId, filename, content, caption) {
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), "utf8");
+  try {
+    await bot.api.sendDocument(chatId, new InputFile(buf, filename), caption ? { caption } : {});
+  } catch (e) {
+    await push(chatId, `⚠️ Could not send file: <code>${esc(e.message)}</code>`);
+  }
+}
+
+function repoDir(repo) {
+  return state.get().repos[repo]?.dir;
 }
 
 async function activeSession(repo) {
@@ -134,6 +150,15 @@ async function sendPrompt(chatId, parts, opts = {}) {
 
 async function onPermissionAsked(repo, p) {
   if (pendingAsks.has(p.id)) return;
+  if (state.get().yolo[repo]) {
+    console.log(`[ask] YOLO auto-approve ${p.id} repo=${repo} tool=${p.permission}`);
+    try {
+      await manager.get(repo).replyPermission(p.id, "always");
+      return;
+    } catch (e) {
+      console.error("[ask] YOLO approve failed:", e.message);
+    }
+  }
   console.log(`[ask] permission registered: ${p.id} repo=${repo} tool=${p.permission}`);
   const what = p.metadata?.command || (p.patterns || []).join(", ") || p.permission;
   const repoTag = Object.keys(state.get().repos).length > 1 ? `[${repo}] ` : "";
@@ -265,6 +290,8 @@ async function onSessionIdle(repo, sessionID) {
     expectingTurn.delete(key);
     await push(ownerChat(), "✅ Finished (no text output).");
   }
+  await maybeBudgetAlert(repo, sessionID);
+  await offerGitActions(ownerChat());
 }
 
 function handleEvent(repo) {
@@ -428,8 +455,10 @@ function ownerOnly() {
       await sendMenu(ctx.chat.id);
       return; // don't treat this first message as a prompt
     }
-    if (String(uid) !== owner) return;
-    if (ctx.chat && state.get().chatId !== ctx.chat.id) state.set({ chatId: ctx.chat.id });
+    const isOwner = String(uid) === owner;
+    const isTeam = state.get().allowedUsers.map(String).includes(String(uid));
+    if (!isOwner && !isTeam) return;
+    if (isOwner && ctx.chat && state.get().chatId !== ctx.chat.id) state.set({ chatId: ctx.chat.id });
     console.log(`[tg] update: ${ctx.updateType}${ctx.callbackQuery ? " " + (ctx.callbackQuery.data || "") : ctx.message?.text ? ` "${ctx.message.text.slice(0, 50)}"` : ""}`);
     await next();
   };
@@ -489,6 +518,16 @@ const HELP_TEXT = [
   "/model [provider/model | list &lt;q&gt;]",
   "/agent [name] · /mode — plan/build toggle",
   "/diff · /todos · /cost · /share · /revert",
+  "",
+  "<b>Power tools</b>",
+  "/commit [msg] · /push — git from your pocket",
+  "/yolo — auto-approve permissions (toggle)",
+  "/files — browse &amp; download workspace files",
+  "/templates — quick-prompt buttons",
+  "/schedule add &lt;spec&gt; | &lt;prompt&gt; — recurring runs",
+  "/export — session transcript · /clone &lt;url&gt;",
+  "/budget &lt;usd&gt; — cost alert · /team — share access",
+  "🎙 Send a voice note → transcribed &amp; sent",
   "/pending — un-answered approvals · /status"
 ].join("\n");
 
@@ -499,6 +538,8 @@ function menuKeyboard() {
     .text("🔁 Diff", "mn|diff").text("✅ Todos", "mn|todos").row()
     .text("💰 Cost", "mn|cost").text("🛑 Abort", "mn|abort").row()
     .text("🧠 Model", "mn|model").text("📁 Repos", "mn|repo").row()
+    .text("🔀 Git", "mn|git").text("⚡ Templates", "mn|templates").row()
+    .text("📂 Files", "mn|files").text("🤖 YOLO", "mn|yolo").row()
     .text("❓ Help", "mn|help");
 }
 
@@ -617,10 +658,354 @@ async function doStatus(chatId) {
   );
 }
 
+// ── YOLO (auto-approve) ────────────────────────────────────────────────
+async function doYolo(chatId) {
+  const repo = activeRepoName();
+  const next = !state.get().yolo[repo];
+  state.set({ yolo: { ...state.get().yolo, [repo]: next } });
+  await push(
+    chatId,
+    next
+      ? `⚡ <b>YOLO ON</b> for <b>${esc(repo)}</b> — permission requests are auto-approved. Use with care.`
+      : `🛡 <b>YOLO OFF</b> for <b>${esc(repo)}</b> — you'll be asked to approve again.`
+  );
+}
+
+// ── Git actions ────────────────────────────────────────────────────────
+async function requireGit(chatId) {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  if (!dir || !(await git.isRepo(dir))) {
+    await push(chatId, "⚠️ The active repo is not a git repository.");
+    return null;
+  }
+  return { repo, dir };
+}
+
+async function doCommit(chatId, message) {
+  const g = await requireGit(chatId);
+  if (!g) return;
+  let changed;
+  try {
+    changed = await git.changes(g.dir);
+  } catch (e) {
+    return push(chatId, `⚠️ ${esc(e.message)}`);
+  }
+  if (!changed.length) return push(chatId, "Nothing to commit — working tree clean.");
+  const msg = (message && message.trim()) || git.suggestMessage(changed);
+  try {
+    await git.commitAll(g.dir, msg);
+    const kb = new InlineKeyboard().text("🚀 Push", "git|push");
+    await push(chatId, `✅ Committed <b>${changed.length}</b> file(s):\n<code>${esc(msg)}</code>`, { reply_markup: kb });
+  } catch (e) {
+    await push(chatId, `⚠️ Commit failed: <code>${esc((e.stderr || e.message || "").slice(-500))}</code>`);
+  }
+}
+
+async function doPush(chatId) {
+  const g = await requireGit(chatId);
+  if (!g) return;
+  try {
+    const out = await git.push(g.dir);
+    await push(chatId, `🚀 Pushed.\n<code>${esc((out || "done").slice(-500))}</code>`);
+  } catch (e) {
+    await push(chatId, `⚠️ Push failed: <code>${esc((e.stderr || e.message || "").slice(-500))}</code>`);
+  }
+}
+
+async function doRevert(chatId) {
+  const repo = activeRepoName();
+  const sid = state.get().activeSessions[repo];
+  if (!sid) return push(chatId, "No active session.");
+  const inst = manager.get(repo);
+  const msgs = await inst.api("GET", `/session/${sid}/message`);
+  const lastUser = [...msgs].reverse().find((m) => m.info.role === "user");
+  if (!lastUser) return push(chatId, "Nothing to revert.");
+  await inst.revertSession(sid, lastUser.info.id);
+  await push(chatId, "⏪ Reverted last turn.");
+}
+
+async function doFullDiffFile(chatId) {
+  const g = await requireGit(chatId);
+  if (!g) return;
+  try {
+    const { stdout } = await git.git(g.dir, ["diff", "HEAD"]);
+    if (!stdout.trim()) return push(chatId, "No diff vs HEAD.");
+    await sendDoc(chatId, `diff-${Date.now()}.diff`, stdout, `${g.repo} diff`);
+  } catch (e) {
+    await push(chatId, `⚠️ ${esc(e.message)}`);
+  }
+}
+
+async function offerGitActions(chatId, { announceClean = false } = {}) {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  if (!dir || !(await git.isRepo(dir))) {
+    if (announceClean) await push(chatId, "⚠️ The active repo is not a git repository.");
+    return;
+  }
+  let changed = [];
+  try {
+    changed = await git.changes(dir);
+  } catch {
+    return;
+  }
+  if (!changed.length) {
+    if (announceClean) await push(chatId, `✅ Working tree clean in <b>${esc(repo)}</b> — nothing to commit.`);
+    return;
+  }
+  const kb = new InlineKeyboard()
+    .text("📥 Commit & push", "git|commitpush")
+    .text("🔁 Diff", "git|diff")
+    .row()
+    .text("📄 Diff file", "git|difffile")
+    .text("⏪ Revert turn", "git|revert");
+  await push(chatId, `🔀 <b>${changed.length}</b> uncommitted change(s) in <b>${esc(repo)}</b>.`, { reply_markup: kb });
+}
+
+// ── Quick-prompt templates ─────────────────────────────────────────────
+const TEMPLATES = {
+  tests: { label: "🧪 Run tests", prompt: "Run the test suite and fix any failures." },
+  lint: { label: "🧹 Fix lint", prompt: "Run the linter/formatter and fix all reported issues." },
+  commitmsg: { label: "✍️ Commit msg", prompt: "Summarize the current uncommitted changes and propose one conventional commit message. Do not commit." },
+  review: { label: "🔎 Review changes", prompt: "Review my uncommitted changes for bugs, security issues, and improvements. Be concise." }
+};
+
+async function doTemplates(chatId) {
+  const kb = new InlineKeyboard();
+  Object.keys(TEMPLATES).forEach((k, i) => {
+    kb.text(TEMPLATES[k].label, `tpl|${k}`);
+    if (i % 2 === 1) kb.row();
+  });
+  await push(chatId, "<b>Quick prompts</b>\nTap one to run it on the active session:", { reply_markup: kb });
+}
+
+// ── File browser ───────────────────────────────────────────────────────
+const lastBrowse = new Map();
+
+async function doFiles(chatId, rel) {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  if (!dir) return push(chatId, "⚠️ No active repo.");
+  let listing;
+  try {
+    listing = files.list(dir, rel || ".");
+  } catch (e) {
+    return push(chatId, `⚠️ ${esc(e.message)}`);
+  }
+  lastBrowse.set(chatId, listing);
+  const kb = new InlineKeyboard();
+  if (listing.rel !== ".") kb.text("⬆️ ..", "fb|up").row();
+  listing.dirs.forEach((d, i) => {
+    kb.text(`📁 ${d.slice(0, 24)}`, `fb|o|${i}`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (listing.dirs.length % 2 === 1) kb.row();
+  listing.files.forEach((f, i) => {
+    kb.text(`📄 ${f.slice(0, 24)}`, `fb|v|${i}`).text("⬇️", `fb|d|${i}`).row();
+  });
+  const where = listing.rel === "." ? "" : listing.rel;
+  const empty = listing.dirs.length + listing.files.length ? "" : "\n<i>(empty)</i>";
+  await push(chatId, `<b>📂 ${esc(repo)}:/${esc(where)}</b>${empty}`, { reply_markup: kb });
+}
+
+// ── Export transcript ──────────────────────────────────────────────────
+async function doExport(chatId) {
+  const repo = activeRepoName();
+  const sid = state.get().activeSessions[repo];
+  if (!sid) return push(chatId, "No active session.");
+  const inst = manager.get(repo);
+  const msgs = await inst.api("GET", `/session/${sid}/message`);
+  const lines = [`# Session ${sid}`, `repo: ${repo}`, ""];
+  for (const m of msgs) {
+    const text = (m.parts || [])
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("\n\n");
+    if (!text.trim()) continue;
+    lines.push(`## ${m.info.role}`, "", text, "");
+  }
+  await sendDoc(chatId, `session-${sid}.md`, lines.join("\n"), "Session transcript");
+}
+
+// ── Clone a repo ───────────────────────────────────────────────────────
+async function doClone(chatId, url, name) {
+  if (!url) return push(chatId, "Usage: /clone &lt;git-url&gt; [name]");
+  const base = (name || url.split("/").pop() || "repo").replace(/\.git$/, "");
+  const safe = base.toLowerCase().replace(/[^a-z0-9-]/g, "") || "repo";
+  const parent = path.dirname(repoDir(activeRepoName()) || process.cwd());
+  const target = path.join(parent, safe);
+  if (fs.existsSync(target)) return push(chatId, `⚠️ <code>${esc(target)}</code> already exists.`);
+  if (state.get().repos[safe]) return push(chatId, `⚠️ Repo name <b>${esc(safe)}</b> is taken.`);
+  await push(chatId, `⏳ Cloning into <code>${esc(target)}</code> …`);
+  try {
+    await git.clone(url, target);
+  } catch (e) {
+    return push(chatId, `⚠️ Clone failed: <code>${esc((e.stderr || e.message || "").slice(-500))}</code>`);
+  }
+  const port = manager.allocPort();
+  manager.register(safe, target, port);
+  state.set({ repos: { ...state.get().repos, [safe]: { dir: target, port } }, activeRepo: safe });
+  try {
+    await manager.get(safe).ensure();
+    manager.get(safe).watchEvents(handleEvent(safe));
+  } catch (e) {
+    return push(chatId, `Cloned & added, but the server failed to start: ${esc(e.message)}`);
+  }
+  await push(chatId, `✅ Cloned & active: <b>${esc(safe)}</b>\n<code>${esc(target)}</code> :${port}`);
+}
+
+// ── Budget alert ───────────────────────────────────────────────────────
+const budgetNotified = new Set();
+async function maybeBudgetAlert(repo, sid) {
+  const limit = state.get().budgetLimit;
+  if (!limit) return;
+  const key = `${repo}|${sid}`;
+  if (budgetNotified.has(key)) return;
+  try {
+    const s = await manager.get(repo).sessionDetail(sid);
+    if ((s.cost || 0) >= limit) {
+      budgetNotified.add(key);
+      await push(ownerChat(), `⚠️ <b>Budget alert</b> — [${esc(repo)}] session cost $${(s.cost || 0).toFixed(4)} ≥ limit $${limit.toFixed(4)}.`);
+    }
+  } catch {}
+}
+
+// ── Scheduler ──────────────────────────────────────────────────────────
+function parseSchedule(spec) {
+  const s = (spec || "").trim().toLowerCase();
+  let m;
+  if ((m = s.match(/^daily\s+(\d{1,2}):(\d{2})$/))) {
+    const hour = Number(m[1]);
+    const minute = Number(m[2]);
+    if (hour > 23 || minute > 59) return null;
+    return { type: "daily", hour, minute };
+  }
+  if ((m = s.match(/^every\s+(\d+)\s*(m|h)$/))) {
+    return { type: "interval", ms: Number(m[1]) * (m[2] === "h" ? 3600000 : 60000) };
+  }
+  return null;
+}
+
+async function doScheduleList(chatId) {
+  const list = state.get().schedules;
+  if (!list.length) {
+    return push(
+      chatId,
+      "<b>Schedules</b>\nNone yet.\n\n/schedule add &lt;spec&gt; | &lt;prompt&gt;\nspec = <code>daily HH:MM</code> or <code>every 30m</code> / <code>every 2h</code>"
+    );
+  }
+  const lines = list.map(
+    (s) => `• <code>${esc(s.id)}</code> [${esc(s.repo)}] <b>${esc(s.spec)}</b>\n   ${esc(s.prompt.slice(0, 80))}`
+  );
+  await push(chatId, `<b>Schedules</b>\n${lines.join("\n")}\n\n/schedule remove &lt;id&gt;`);
+}
+
+function startScheduler() {
+  setInterval(async () => {
+    const now = Date.now();
+    const d = new Date();
+    let changedState = false;
+    for (const sc of state.get().schedules) {
+      let due = false;
+      if (sc.type === "interval") due = !sc.lastRun || now - sc.lastRun >= sc.ms;
+      else if (sc.type === "daily") {
+        if (d.getHours() === sc.hour && d.getMinutes() === sc.minute) {
+          due = !sc.lastRun || now - sc.lastRun > 90 * 1000;
+        }
+      }
+      if (!due) continue;
+      sc.lastRun = now;
+      changedState = true;
+      try {
+        if (sc.repo && state.get().repos[sc.repo]) state.set({ activeRepo: sc.repo });
+        await push(ownerChat(), `⏰ Scheduled run [${esc(sc.repo)}]: <code>${esc(sc.prompt.slice(0, 80))}</code>`);
+        await sendPrompt(ownerChat(), [{ type: "text", text: sc.prompt }]);
+      } catch (e) {
+        console.error("[sched] fire failed:", e.message);
+      }
+    }
+    if (changedState) state.set({ schedules: state.get().schedules });
+  }, 30000).unref();
+}
+
 function registerCommands() {
   bot.command("start", (ctx) => push(ctx.chat.id, HELP_TEXT));
   bot.command("help", (ctx) => push(ctx.chat.id, HELP_TEXT));
   bot.command("menu", (ctx) => sendMenu(ctx.chat.id));
+  bot.command("yolo", (ctx) => doYolo(ctx.chat.id));
+  bot.command("commit", (ctx) => doCommit(ctx.chat.id, (ctx.match || "").trim()));
+  bot.command("push", (ctx) => doPush(ctx.chat.id));
+  bot.command("files", (ctx) => doFiles(ctx.chat.id, (ctx.match || "").trim() || "."));
+  bot.command("export", (ctx) => doExport(ctx.chat.id));
+  bot.command("templates", (ctx) => doTemplates(ctx.chat.id));
+  bot.command("clone", (ctx) => {
+    const arg = (ctx.match || "").trim().split(/\s+/);
+    doClone(ctx.chat.id, arg[0], arg[1]);
+  });
+
+  bot.command("budget", async (ctx) => {
+    const arg = (ctx.match || "").trim();
+    if (!arg) {
+      const cur = state.get().budgetLimit;
+      return push(ctx.chat.id, `💰 Budget alert limit: <b>${cur ? "$" + cur.toFixed(4) : "off"}</b>\n/budget &lt;amount&gt; — set (0 = off)`);
+    }
+    const n = Number(arg);
+    if (Number.isNaN(n) || n < 0) return push(ctx.chat.id, "Usage: /budget &lt;amount in USD&gt;");
+    state.set({ budgetLimit: n });
+    budgetNotified.clear();
+    await push(ctx.chat.id, n ? `💰 Budget alert set to $${n.toFixed(4)}.` : "💰 Budget alert disabled.");
+  });
+
+  bot.command("schedule", async (ctx) => {
+    const arg = (ctx.match || "").trim();
+    if (!arg) return doScheduleList(ctx.chat.id);
+    if (arg.startsWith("remove ")) {
+      const id = arg.slice(7).trim();
+      const next = state.get().schedules.filter((s) => s.id !== id);
+      if (next.length === state.get().schedules.length) return push(ctx.chat.id, "No such schedule id.");
+      state.set({ schedules: next });
+      return push(ctx.chat.id, `🗑 Removed schedule <code>${esc(id)}</code>.`);
+    }
+    if (arg.startsWith("add ")) {
+      const rest = arg.slice(4);
+      const bar = rest.indexOf("|");
+      if (bar < 0) return push(ctx.chat.id, "Usage: /schedule add &lt;spec&gt; | &lt;prompt&gt;");
+      const spec = rest.slice(0, bar).trim();
+      const prompt = rest.slice(bar + 1).trim();
+      const parsed = parseSchedule(spec);
+      if (!parsed) return push(ctx.chat.id, "Bad spec. Use <code>daily HH:MM</code> or <code>every 30m</code> / <code>every 2h</code>.");
+      if (!prompt) return push(ctx.chat.id, "Add a prompt after the <code>|</code>.");
+      const id = "sc" + Math.random().toString(36).slice(2, 8);
+      const sc = { id, spec, prompt, repo: activeRepoName(), ...parsed, lastRun: 0 };
+      state.set({ schedules: [...state.get().schedules, sc] });
+      return push(ctx.chat.id, `⏰ Scheduled <code>${esc(id)}</code> — <b>${esc(spec)}</b> on <b>${esc(sc.repo)}</b>.`);
+    }
+    await doScheduleList(ctx.chat.id);
+  });
+
+  bot.command("team", async (ctx) => {
+    if (String(ctx.from?.id) !== currentOwner()) return push(ctx.chat.id, "Only the owner can manage the team.");
+    const arg = (ctx.match || "").trim();
+    const allowed = state.get().allowedUsers;
+    if (!arg) {
+      const lines = allowed.length ? allowed.map((u) => `• <code>${esc(String(u))}</code>`).join("\n") : "none";
+      return push(ctx.chat.id, `<b>Allowed users</b> (besides you)\n${lines}\n\n/team add &lt;id&gt; · /team remove &lt;id&gt;`);
+    }
+    if (arg.startsWith("add ")) {
+      const id = Number(arg.slice(4).trim());
+      if (!id) return push(ctx.chat.id, "Usage: /team add &lt;numeric id&gt;");
+      if (allowed.includes(id)) return push(ctx.chat.id, "Already added.");
+      state.set({ allowedUsers: [...allowed, id] });
+      return push(ctx.chat.id, `👥 Added <code>${esc(String(id))}</code>.`);
+    }
+    if (arg.startsWith("remove ")) {
+      const id = Number(arg.slice(7).trim());
+      state.set({ allowedUsers: allowed.filter((u) => u !== id) });
+      return push(ctx.chat.id, `👥 Removed <code>${esc(String(id))}</code>.`);
+    }
+    await push(ctx.chat.id, "Usage: /team add|remove &lt;id&gt;");
+  });
 
   bot.command("new", async (ctx) => {
     const arg = (ctx.match || "").trim();
@@ -841,8 +1226,70 @@ function registerCallbacks() {
           case "abort": await doAbort(chatId); break;
           case "model": await doModelInfo(chatId); break;
           case "repo": await doRepoList(chatId); break;
+          case "git": await offerGitActions(chatId, { announceClean: true }); break;
+          case "templates": await doTemplates(chatId); break;
+          case "files": await doFiles(chatId, "."); break;
+          case "yolo": await doYolo(chatId); break;
           case "help": await push(chatId, HELP_TEXT); break;
           default: break;
+        }
+        return;
+      }
+      if (data.startsWith("git|")) {
+        const [, act] = data.split("|");
+        console.log(`[cb] git action: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        if (act === "commit") await doCommit(ctx.chat.id);
+        else if (act === "push") await doPush(ctx.chat.id);
+        else if (act === "commitpush") {
+          await doCommit(ctx.chat.id);
+          await doPush(ctx.chat.id);
+        } else if (act === "diff") await doDiff(ctx.chat.id);
+        else if (act === "difffile") await doFullDiffFile(ctx.chat.id);
+        else if (act === "revert") await doRevert(ctx.chat.id);
+        return;
+      }
+      if (data.startsWith("tpl|")) {
+        const [, k] = data.split("|");
+        console.log(`[cb] template: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        const t = TEMPLATES[k];
+        if (t) await sendPrompt(ctx.chat.id, [{ type: "text", text: t.prompt }]);
+        return;
+      }
+      if (data.startsWith("fb|")) {
+        const [, act, iStr] = data.split("|");
+        console.log(`[cb] files: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        const b = lastBrowse.get(ctx.chat.id);
+        if (!b) {
+          await push(ctx.chat.id, "File list expired — /files again.");
+          return;
+        }
+        const dir = repoDir(activeRepoName());
+        const join = (name) => (b.rel === "." ? "" : b.rel + "/") + name;
+        if (act === "up") {
+          const parent = b.rel === "." ? "." : b.rel.split("/").slice(0, -1).join("/") || ".";
+          await doFiles(ctx.chat.id, parent);
+        } else if (act === "o") {
+          const name = b.dirs[Number(iStr)];
+          if (name) await doFiles(ctx.chat.id, join(name));
+        } else if (act === "v" || act === "d") {
+          const name = b.files[Number(iStr)];
+          if (!name) return;
+          const rel = join(name);
+          let f;
+          try {
+            f = files.readFile(dir, rel);
+          } catch (e) {
+            await push(ctx.chat.id, `⚠️ ${esc(e.message)}`);
+            return;
+          }
+          if (act === "d" || f.size > files.MAX_VIEW_BYTES || !files.isProbablyText(f.buffer)) {
+            await sendDoc(ctx.chat.id, name, f.buffer, rel);
+          } else {
+            await push(ctx.chat.id, `<b>${esc(rel)}</b>\n<pre><code>${esc(f.buffer.toString("utf8"))}</code></pre>`);
+          }
         }
         return;
       }
@@ -967,6 +1414,34 @@ function registerMessages() {
   });
 }
 
+async function handleVoice(ctx, fileId, name, caption) {
+  const chatId = ctx.chat.id;
+  if (!stt.enabled()) {
+    await push(chatId, "🎙 Voice not configured — add STT_API_KEY (and optionally STT_API_URL / STT_MODEL) to .env to enable transcription.");
+    return;
+  }
+  try {
+    const { buffer } = await media.downloadTelegramFile(TOKEN, fileId);
+    await push(chatId, "🎙 Transcribing…");
+    let text;
+    try {
+      text = await stt.transcribe(buffer, name);
+    } catch (e) {
+      await push(chatId, `⚠️ Transcription failed: <code>${esc(e.message)}</code>`);
+      return;
+    }
+    if (!text) {
+      await push(chatId, "🎙 Couldn't make out any speech.");
+      return;
+    }
+    await push(chatId, `🎙 <i>${esc(text)}</i>`);
+    const prompt = caption ? `${caption}\n\n${text}` : text;
+    await sendPrompt(chatId, [{ type: "text", text: prompt }]);
+  } catch (e) {
+    await push(chatId, `⚠️ Voice handling failed: <code>${esc(e.message)}</code>`);
+  }
+}
+
 async function handleIncomingFile(ctx, fileId, mime, name, caption) {
   const chatId = ctx.chat.id;
   try {
@@ -1007,13 +1482,10 @@ function registerMedia() {
     await handleIncomingFile(ctx, d.file_id, d.mime_type || "application/octet-stream", d.file_name || `file-${Date.now()}`, ctx.message.caption);
   });
 
-  bot.on("message:voice", async (ctx) => {
-    await push(ctx.chat.id, "🎙 Voice not configured yet — add STT_API_KEY to .env to enable it.");
-  });
-
-  bot.on("message:audio", async (ctx) => {
-    await push(ctx.chat.id, "🎙 Audio not configured yet — add STT_API_KEY to .env to enable it.");
-  });
+  bot.on("message:voice", async (ctx) => handleVoice(ctx, ctx.message.voice.file_id, "voice.ogg", ctx.message.caption));
+  bot.on("message:audio", async (ctx) =>
+    handleVoice(ctx, ctx.message.audio.file_id, ctx.message.audio.file_name || "audio.mp3", ctx.message.caption)
+  );
 }
 
 async function main() {
@@ -1026,6 +1498,7 @@ async function main() {
   await manager.ensureAll();
   manager.startWatchdog();
   startReconcile();
+  startScheduler();
   for (const [name, inst] of manager.instances) {
     console.log(`[bridge] opencode[${name}] ${inst.adopted ? "adopted" : "spawned"} at ${inst.base} (${inst.dir})`);
     inst.watchEvents(handleEvent(name));
@@ -1054,6 +1527,16 @@ async function main() {
     { command: "diff", description: "Session file changes" },
     { command: "todos", description: "Session todo list" },
     { command: "cost", description: "Session tokens and cost" },
+    { command: "commit", description: "Commit all changes" },
+    { command: "push", description: "Push to remote" },
+    { command: "yolo", description: "Toggle auto-approve" },
+    { command: "files", description: "Browse workspace files" },
+    { command: "templates", description: "Quick-prompt buttons" },
+    { command: "schedule", description: "Recurring prompts" },
+    { command: "export", description: "Export transcript" },
+    { command: "clone", description: "Clone a git repo" },
+    { command: "budget", description: "Cost alert limit" },
+    { command: "team", description: "Manage allowed users" },
     { command: "share", description: "Get share URL" },
     { command: "revert", description: "Undo last turn" },
     { command: "pending", description: "Pending approvals/questions" },
