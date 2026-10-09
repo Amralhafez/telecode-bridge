@@ -62,8 +62,25 @@ text to prompt the active session, or `/help` for the full command list.
 | `/diff` · `/todos` · `/cost` | Session changes / todos / token cost |
 | `/share` · `/revert` | Share URL / undo last turn |
 | `/pending` · `/status` | Pending approvals / bridge status |
+| `/menu` | Button menu for everything |
+| `/commit [msg]` · `/push` | Git commit (auto message) and push |
+| `/yolo` | Toggle auto-approval of permission requests |
+| `/files` | Browse & download workspace files |
+| `/templates` | Quick-prompt buttons (tests, lint, review…) |
+| `/schedule add <spec> \| <prompt>` | Recurring runs (`daily HH:MM`, `every 30m`, `every 2h`) |
+| `/export` | Session transcript as Markdown |
+| `/clone <url> [name]` | Clone a git repo and register it |
+| `/budget <usd>` | Alert when a session's cost crosses a limit |
+| `/team add\|remove <id>` | Let other Telegram users in (owner only) |
 
-Photos and documents with a caption are forwarded to the session too.
+Photos and documents with a caption are forwarded to the session too, and
+**voice notes are transcribed** and sent as prompts when STT is configured.
+
+## Voice notes (optional)
+
+Set `STT_API_KEY` in `.env` to turn voice messages into prompts. Any
+OpenAI-compatible `/audio/transcriptions` endpoint works — override
+`STT_API_URL` and `STT_MODEL` to point at a different provider.
 
 ## Running it in the background
 
