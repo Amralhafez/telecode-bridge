@@ -39,6 +39,7 @@ const toolSeen = new Set();
 const expectingTurn = new Set();
 const retryNotified = new Set();
 const pendingAsks = new Map();
+const pendingInput = new Map();
 const turnViews = new Map();
 let bot;
 let manager;
@@ -79,6 +80,27 @@ async function activeSession(repo) {
 
 function turnKey(repo, sid) {
   return `${repo}|${sid}`;
+}
+
+async function startNewSession(chatId, text, { runAsPrompt = false } = {}) {
+  const repo = activeRepoName();
+  const inst = manager.get(repo);
+  if (!inst) {
+    await push(chatId, "⚠️ ما في ريبو فعّال — استخدم /repo أول.");
+    return null;
+  }
+  const title = (text && text.trim() ? text.trim() : `tg ${new Date().toISOString().slice(0, 16)}`).slice(0, 80);
+  let s;
+  try {
+    s = await inst.createSession(title);
+  } catch (e) {
+    await push(chatId, `⚠️ ما قدرت أفتح جلسة: <code>${esc(e.message)}</code>`);
+    return null;
+  }
+  state.set({ activeSessions: { ...state.get().activeSessions, [repo]: s.id } });
+  await push(chatId, `🆕 [${esc(repo)}] جلسة جديدة: <b>${esc(title)}</b>\n<code>${esc(s.id)}</code>`);
+  if (runAsPrompt && text && text.trim()) await sendPrompt(chatId, [{ type: "text", text: text.trim() }]);
+  return s;
 }
 
 async function sendPrompt(chatId, parts, opts = {}) {
@@ -408,7 +430,16 @@ async function sessionsList(chatId) {
   const lines = sessions.map(
     (s, i) => `${s.id === active ? "▶️" : `<b>${i + 1}.</b>`} ${esc((s.title || "untitled").slice(0, 60))}\n      <i>${esc(s.id)}</i>`
   );
-  await push(chatId, `<b>repo: ${esc(repo)}</b>\n\n${lines.length ? lines.join("\n") : "No sessions yet — send a message or /new"}`);
+  if (!sessions.length) {
+    await push(chatId, `<b>repo: ${esc(repo)}</b>\n\nما في جلسات بعد — ابعت رسالة أو /new`);
+    return;
+  }
+  const kb = new InlineKeyboard();
+  sessions.forEach((s, i) => {
+    kb.text(`${s.id === active ? "▶️" : ""}${i + 1}`, `sw|${i}`);
+    if (i % 5 === 4) kb.row();
+  });
+  await push(chatId, `<b>repo: ${esc(repo)}</b>\n\n${lines.join("\n")}\n\n<i>اكبس الرقم للتبديل:</i>`, { reply_markup: kb });
 }
 
 async function modelsList(inst, query) {
@@ -432,9 +463,9 @@ function registerCommands() {
     "Photos/documents + caption → sent to the session.",
     "Approvals and questions arrive here as buttons.",
     "",
-    "/new &lt;title&gt; — fresh session",
-    "/sessions — list · /switch &lt;n&gt; — switch",
-    "/abort — stop current task",
+    "/new — fresh session (asks what to do) · /new &lt;title&gt;",
+    "/sessions — list + tap to switch · /switch &lt;n&gt;",
+    "/abort — stop current task · /cancel — drop a pending prompt",
     "/repo — list · /repo &lt;name&gt; — switch",
     "/repo add &lt;name&gt; &lt;path&gt; — add a repo",
     "/repo remove &lt;name&gt;",
@@ -448,11 +479,21 @@ function registerCommands() {
   bot.command("help", (ctx) => push(ctx.chat.id, helpText));
 
   bot.command("new", async (ctx) => {
-    const repo = activeRepoName();
-    const title = (ctx.match || "").trim() || `tg ${new Date().toISOString().slice(0, 16)}`;
-    const s = await manager.get(repo).createSession(title.slice(0, 80));
-    state.set({ activeSessions: { ...state.get().activeSessions, [repo]: s.id } });
-    await push(ctx.chat.id, `🆕 [${esc(repo)}] Session: <b>${esc(title.slice(0, 80))}</b>\n<code>${esc(s.id)}</code>`);
+    const arg = (ctx.match || "").trim();
+    if (!arg) {
+      pendingInput.set(ctx.chat.id, { type: "new_session" });
+      await push(
+        ctx.chat.id,
+        "🆕 <b>جلسة جديدة</b>\nاكتب شو بدك تعمل (أو اسم للجلسة) ومنبلّش فوراً 👇\n\n<i>/cancel للإلغاء.</i>"
+      );
+      return;
+    }
+    await startNewSession(ctx.chat.id, arg);
+  });
+
+  bot.command("cancel", async (ctx) => {
+    if (pendingInput.delete(ctx.chat.id)) await push(ctx.chat.id, "✖️ تم الإلغاء.");
+    else await push(ctx.chat.id, "ما في شي معلّق لإلغائه.");
   });
 
   bot.command("sessions", async (ctx) => sessionsList(ctx.chat.id));
@@ -735,6 +776,19 @@ function registerCallbacks() {
         state.set({ activeAgents: { ...state.get().activeAgents, [repo]: name } });
         await ctx.editMessageText(`🎛 [${esc(repo)}] agent switched to <b>${esc(name)}</b>${name === "plan" ? " (read-only)" : ""}`).catch(() => {});
         await ctx.answerCallbackQuery({ text: `Agent: ${name}` });
+      } else if (data.startsWith("sw|")) {
+        const [, idx] = data.split("|");
+        console.log(`[cb] session switch: ${data}`);
+        const repo = activeRepoName();
+        const list = state.get().lastSessionLists[repo] || [];
+        const sid = list[Number(idx)];
+        if (!sid) {
+          await ctx.answerCallbackQuery({ text: "الجلسة ما عادت موجودة — /sessions" });
+          return;
+        }
+        state.set({ activeSessions: { ...state.get().activeSessions, [repo]: sid } });
+        await ctx.editMessageText(`🔄 [${esc(repo)}] تم التبديل للجلسة #${Number(idx) + 1}\n<code>${esc(sid)}</code>`, { parse_mode: "HTML" }).catch(() => {});
+        await ctx.answerCallbackQuery({ text: "تم التبديل ✅" });
       } else if (data.startsWith("q|")) {
         const [, reqId, qi, oi] = data.split("|");
         console.log(`[cb] question answer: ${data}`);
@@ -779,6 +833,15 @@ function registerMessages() {
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return;
     const chatId = ctx.chat.id;
+
+    const pend = pendingInput.get(chatId);
+    if (pend) {
+      pendingInput.delete(chatId);
+      if (pend.type === "new_session") {
+        await startNewSession(chatId, text, { runAsPrompt: true });
+        return;
+      }
+    }
 
     const openQuestion = [...pendingAsks.values()].find(
       (a) => a.kind === "question" && a.chatId === chatId && a.answers.some((x) => x === null)
@@ -891,10 +954,11 @@ async function main() {
 
   await bot.init();
   await bot.api.setMyCommands([
-    { command: "new", description: "Start a new session" },
-    { command: "sessions", description: "List recent sessions" },
+    { command: "new", description: "New session — asks what to do" },
+    { command: "sessions", description: "List sessions (tap to switch)" },
     { command: "switch", description: "Switch to session n" },
     { command: "abort", description: "Stop the current task" },
+    { command: "cancel", description: "Cancel a pending prompt" },
     { command: "repo", description: "List / switch / add repos" },
     { command: "model", description: "Show or set the model" },
     { command: "mode", description: "Switch plan / build mode" },
