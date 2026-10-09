@@ -39,8 +39,11 @@ async function main() {
   console.log("\n1) Create a bot with @BotFather on Telegram and paste its token.");
   const token = await ask("TELEGRAM_BOT_TOKEN", cur.TELEGRAM_BOT_TOKEN);
 
-  console.log("\n2) Get your numeric id from @userinfobot (only you may use the bot).");
-  const owner = await ask("TELEGRAM_OWNER_ID", cur.TELEGRAM_OWNER_ID);
+  console.log("\n2) Your Telegram user id — ONLY this person may use the bot.");
+  console.log("   Leave this EMPTY to auto-pair: the first person who messages");
+  console.log("   the bot (you, by tapping Start) is locked in as the owner.");
+  console.log("   Or paste your numeric id from @userinfobot to set it now.");
+  const owner = await ask("TELEGRAM_OWNER_ID (empty = auto-pair)", cur.TELEGRAM_OWNER_ID);
 
   console.log("\n3) Absolute path of the project opencode should work on.");
   const workspace = await ask("WORKSPACE_DIR", cur.WORKSPACE_DIR || process.cwd());
@@ -63,11 +66,13 @@ async function main() {
   fs.writeFileSync(ENV_PATH, content);
   rl.close();
 
-  const missing = [];
-  if (!token) missing.push("TELEGRAM_BOT_TOKEN");
-  if (!owner) missing.push("TELEGRAM_OWNER_ID");
   console.log(`\n✓ Wrote ${ENV_PATH}`);
-  if (missing.length) console.log(`⚠ Still empty: ${missing.join(", ")} — the bridge won't start until these are set.`);
+  if (!token) {
+    console.log("⚠ TELEGRAM_BOT_TOKEN is empty — the bridge won't start until it's set.");
+  } else if (!owner) {
+    console.log("ℹ No owner set — auto-pairing is ON. Run `npm start`, then open your");
+    console.log("  bot in Telegram and tap Start to claim ownership.");
+  }
   console.log("\nNext:  npm start\n");
 }
 

@@ -8,13 +8,17 @@ const { mdToHtml, splitHtml, esc, fmtDiff, fmtTodos, fmtCost } = require("./form
 const { TurnView, editSafe } = require("./stream");
 const media = require("./media");
 
-const OWNER = String(process.env.TELEGRAM_OWNER_ID || "");
+const OWNER_ENV = String(process.env.TELEGRAM_OWNER_ID || "");
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const PASSWORD = process.env.OPENCODE_SERVER_PASSWORD || "";
-if (!TOKEN || !OWNER) {
-  console.error("[bridge] TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID are required");
+if (!TOKEN) {
+  console.error("[bridge] TELEGRAM_BOT_TOKEN is required");
   process.exit(1);
 }
+// Owner id comes from the persisted state (set by auto-pairing) or from the
+// env var. If neither is set the bridge runs in PAIRING mode: the first person
+// who messages the bot becomes the owner and gets locked in.
+const currentOwner = () => String(state.get().ownerId || OWNER_ENV || "");
 
 const lockFile = path.join(__dirname, "..", "bridge.lock");
 try {
@@ -44,7 +48,7 @@ const turnViews = new Map();
 let bot;
 let manager;
 
-const ownerChat = () => state.get().chatId || Number(OWNER);
+const ownerChat = () => state.get().chatId || Number(currentOwner()) || 0;
 const activeRepoName = () => state.get().activeRepo || Object.keys(state.get().repos)[0];
 
 async function push(chatId, html, extra = {}) {
@@ -411,7 +415,20 @@ async function submitAnswers(ask) {
 function ownerOnly() {
   return async (ctx, next) => {
     const uid = ctx.from?.id;
-    if (uid === undefined || String(uid) !== OWNER) return;
+    if (uid === undefined) return;
+    const owner = currentOwner();
+    if (!owner) {
+      // Pairing mode: claim ownership for the first user who messages us.
+      state.set({ ownerId: uid, chatId: ctx.chat?.id ?? null });
+      console.log(`[tg] paired with owner ${uid}`);
+      await push(
+        ctx.chat.id,
+        "✅ <b>Paired!</b> You're now the owner of this bridge.\nNobody else can use it.\n\nTap a button below to get going 👇"
+      );
+      await sendMenu(ctx.chat.id);
+      return; // don't treat this first message as a prompt
+    }
+    if (String(uid) !== owner) return;
     if (ctx.chat && state.get().chatId !== ctx.chat.id) state.set({ chatId: ctx.chat.id });
     console.log(`[tg] update: ${ctx.updateType}${ctx.callbackQuery ? " " + (ctx.callbackQuery.data || "") : ctx.message?.text ? ` "${ctx.message.text.slice(0, 50)}"` : ""}`);
     await next();
@@ -455,39 +472,159 @@ async function modelsList(inst, query) {
   return filtered.slice(0, 40);
 }
 
-function registerCommands() {
-  const helpText = [
-    "<b>TeleCode</b> — opencode on Telegram",
-    "",
-    "Type any message → prompt to the active session (streamed live).",
-    "Photos/documents + caption → sent to the session.",
-    "Approvals and questions arrive here as buttons.",
-    "",
-    "/new — fresh session (asks what to do) · /new &lt;title&gt;",
-    "/sessions — list + tap to switch · /switch &lt;n&gt;",
-    "/abort — stop current task · /cancel — drop a pending prompt",
-    "/repo — list · /repo &lt;name&gt; — switch",
-    "/repo add &lt;name&gt; &lt;path&gt; — add a repo",
-    "/repo remove &lt;name&gt;",
-    "/model [provider/model | list &lt;q&gt;]",
-    "/agent [name] · /mode — plan/build toggle",
-    "/diff · /todos · /cost · /share · /revert",
-    "/pending — un-answered approvals · /status"
-  ].join("\n");
+const HELP_TEXT = [
+  "<b>TeleCode</b> — opencode on Telegram",
+  "",
+  "Type any message → prompt to the active session (streamed live).",
+  "Photos/documents + caption → sent to the session.",
+  "Approvals and questions arrive here as buttons.",
+  "",
+  "/menu — buttons for everything",
+  "/new — fresh session (asks what to do) · /new &lt;title&gt;",
+  "/sessions — list + tap to switch · /switch &lt;n&gt;",
+  "/abort — stop current task · /cancel — drop a pending prompt",
+  "/repo — list · /repo &lt;name&gt; — switch",
+  "/repo add &lt;name&gt; &lt;path&gt; — add a repo",
+  "/repo remove &lt;name&gt;",
+  "/model [provider/model | list &lt;q&gt;]",
+  "/agent [name] · /mode — plan/build toggle",
+  "/diff · /todos · /cost · /share · /revert",
+  "/pending — un-answered approvals · /status"
+].join("\n");
 
-  bot.command("start", (ctx) => push(ctx.chat.id, helpText));
-  bot.command("help", (ctx) => push(ctx.chat.id, helpText));
+function menuKeyboard() {
+  return new InlineKeyboard()
+    .text("🆕 New", "mn|new").text("📋 Sessions", "mn|sessions").row()
+    .text("📊 Status", "mn|status").text("🎛 Mode", "mn|mode").row()
+    .text("🔁 Diff", "mn|diff").text("✅ Todos", "mn|todos").row()
+    .text("💰 Cost", "mn|cost").text("🛑 Abort", "mn|abort").row()
+    .text("🧠 Model", "mn|model").text("📁 Repos", "mn|repo").row()
+    .text("❓ Help", "mn|help");
+}
+
+async function sendMenu(chatId) {
+  await push(
+    chatId,
+    "<b>TeleCode — menu</b>\nTap an action, or just type a message to prompt the active session.",
+    { reply_markup: menuKeyboard() }
+  );
+}
+
+async function askNewSession(chatId) {
+  pendingInput.set(chatId, { type: "new_session" });
+  await push(
+    chatId,
+    "🆕 <b>New session</b>\nTell me what you want to do (or a name for the session) and we'll start right away 👇\n\n<i>/cancel to abort.</i>"
+  );
+}
+
+async function doAbort(chatId) {
+  const repo = activeRepoName();
+  const sid = state.get().activeSessions[repo];
+  if (!sid) return push(chatId, "No active session.");
+  try {
+    await manager.get(repo).abortSession(sid);
+    const key = turnKey(repo, sid);
+    expectingTurn.delete(key);
+    const view = turnViews.get(key);
+    if (view && !view.closed) await view.finalize("");
+    await push(chatId, "🛑 Abort sent.");
+  } catch (e) {
+    await push(chatId, `⚠️ Abort failed: ${esc(e.message)}`);
+  }
+}
+
+async function doDiff(chatId) {
+  const repo = activeRepoName();
+  const sid = state.get().activeSessions[repo];
+  if (!sid) return push(chatId, "No active session.");
+  const diffs = await manager.get(repo).sessionDiff(sid);
+  await push(chatId, `<b>[${esc(repo)}] Diff</b>\n${fmtDiff(diffs)}`);
+}
+
+async function doTodos(chatId) {
+  const repo = activeRepoName();
+  const sid = state.get().activeSessions[repo];
+  if (!sid) return push(chatId, "No active session.");
+  const todos = await manager.get(repo).sessionTodo(sid);
+  await push(chatId, `<b>[${esc(repo)}] Todos</b>\n${fmtTodos(todos)}`);
+}
+
+async function doCost(chatId) {
+  const repo = activeRepoName();
+  const sid = state.get().activeSessions[repo];
+  if (!sid) return push(chatId, "No active session.");
+  const s = await manager.get(repo).sessionDetail(sid);
+  await push(chatId, `<b>[${esc(repo)}]</b> ${esc((s.title || "").slice(0, 50))}\n${fmtCost(s)}`);
+}
+
+async function doMode(chatId) {
+  const repo = activeRepoName();
+  let names = ["build", "plan"];
+  try {
+    const agents = await manager.get(repo).api("GET", "/agent");
+    const top = agents.filter((a) => a.mode !== "subagent").map((a) => a.name);
+    if (top.length) names = top;
+  } catch {}
+  const cur = state.get().activeAgents[repo] || names[0] || "build";
+  const kb = new InlineKeyboard();
+  for (const n of names.slice(0, 8)) kb.text(n === cur ? `● ${n} (current)` : n, `m|${n}`).row();
+  await push(
+    chatId,
+    `🎛 [${esc(repo)}] agent: <b>${esc(cur)}</b>\n${cur === "plan" ? "Plan mode: read-only, no edits." : "Build mode: full edit + run powers."}\nTap to switch:`,
+    { reply_markup: kb }
+  );
+}
+
+async function doModelInfo(chatId) {
+  const repo = activeRepoName();
+  const cur = state.get().activeModels[repo] || "(provider default)";
+  await push(
+    chatId,
+    `🧠 [${esc(repo)}] model: <b>${esc(cur)}</b>\n/model list [query] — browse\n/model provider/model — set\n/model clear — reset`
+  );
+}
+
+async function doRepoList(chatId) {
+  const repos = state.get().repos;
+  const lines = Object.entries(repos).map(([name, r]) =>
+    `${name === state.get().activeRepo ? "▶️" : "•"} <b>${esc(name)}</b> — <code>${esc(r.dir)}</code> :${r.port}`
+  );
+  await push(chatId, `<b>Repos</b>\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`);
+}
+
+async function doStatus(chatId) {
+  const repo = activeRepoName();
+  const sid = state.get().activeSessions[repo];
+  let statusLine = "no active session";
+  let title = "-";
+  if (sid) {
+    try {
+      const sts = await manager.get(repo).sessionStatuses();
+      const st = sts[sid];
+      statusLine = st ? st.type : "idle";
+      const s = (await manager.get(repo).listSessions()).find((x) => x.id === sid);
+      title = s?.title || "-";
+    } catch {}
+  }
+  let version = "?";
+  try {
+    version = (await manager.get(repo).api("GET", "/global/health")).version;
+  } catch {}
+  await push(
+    chatId,
+    `🟢 TeleCode bridge\nopencode: <code>${esc(version)}</code>\nrepo: <b>${esc(repo)}</b>\nsession: ${esc(title)}\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\nmodel: <b>${esc(state.get().activeModels[repo] || "default")}</b>\nagent: <b>${esc(state.get().activeAgents[repo] || "default")}</b>\npending asks: ${pendingAsks.size}`
+  );
+}
+
+function registerCommands() {
+  bot.command("start", (ctx) => push(ctx.chat.id, HELP_TEXT));
+  bot.command("help", (ctx) => push(ctx.chat.id, HELP_TEXT));
+  bot.command("menu", (ctx) => sendMenu(ctx.chat.id));
 
   bot.command("new", async (ctx) => {
     const arg = (ctx.match || "").trim();
-    if (!arg) {
-      pendingInput.set(ctx.chat.id, { type: "new_session" });
-      await push(
-        ctx.chat.id,
-        "🆕 <b>New session</b>\nTell me what you want to do (or a name for the session) and we'll start right away 👇\n\n<i>/cancel to abort.</i>"
-      );
-      return;
-    }
+    if (!arg) return askNewSession(ctx.chat.id);
     await startNewSession(ctx.chat.id, arg);
   });
 
@@ -511,24 +648,7 @@ function registerCommands() {
     await push(ctx.chat.id, `🔄 [${esc(repo)}] Switched to <code>${esc(sid)}</code>`);
   });
 
-  bot.command("abort", async (ctx) => {
-    const repo = activeRepoName();
-    const sid = state.get().activeSessions[repo];
-    if (!sid) {
-      await push(ctx.chat.id, "No active session.");
-      return;
-    }
-    try {
-      await manager.get(repo).abortSession(sid);
-      const key = turnKey(repo, sid);
-      expectingTurn.delete(key);
-      const view = turnViews.get(key);
-      if (view && !view.closed) await view.finalize("");
-      await push(ctx.chat.id, "🛑 Abort sent.");
-    } catch (e) {
-      await push(ctx.chat.id, `⚠️ Abort failed: ${esc(e.message)}`);
-    }
-  });
+  bot.command("abort", (ctx) => doAbort(ctx.chat.id));
 
   bot.command("repo", async (ctx) => {
     const arg = (ctx.match || "").trim();
@@ -645,19 +765,7 @@ function registerCommands() {
     await push(ctx.chat.id, `🧠 [${esc(repo)}] Model set: <b>${esc(arg)}</b>`);
   });
 
-  bot.command("mode", async (ctx) => {
-    const repo = activeRepoName();
-    let names = ["build", "plan"];
-    try {
-      const agents = await manager.get(repo).api("GET", "/agent");
-      const top = agents.filter((a) => a.mode !== "subagent").map((a) => a.name);
-      if (top.length) names = top;
-    } catch {}
-    const cur = state.get().activeAgents[repo] || names[0] || "build";
-    const kb = new InlineKeyboard();
-    for (const n of names.slice(0, 8)) kb.text(n === cur ? `● ${n} (current)` : n, `m|${n}`).row();
-    await push(ctx.chat.id, `🎛 [${esc(repo)}] agent: <b>${esc(cur)}</b>\n${cur === "plan" ? "Plane mode: read-only, no edits." : "Build mode: full edit + run powers."}\nTap to switch:`, { reply_markup: kb });
-  });
+  bot.command("mode", (ctx) => doMode(ctx.chat.id));
 
   bot.command("agent", async (ctx) => {
     const repo = activeRepoName();
@@ -680,29 +788,9 @@ function registerCommands() {
     await push(ctx.chat.id, `🤖 [${esc(repo)}] Agent set: <b>${esc(arg)}</b>`);
   });
 
-  bot.command("diff", async (ctx) => {
-    const repo = activeRepoName();
-    const sid = state.get().activeSessions[repo];
-    if (!sid) return push(ctx.chat.id, "No active session.");
-    const diffs = await manager.get(repo).sessionDiff(sid);
-    await push(ctx.chat.id, `<b>[${esc(repo)}] Diff</b>\n${fmtDiff(diffs)}`);
-  });
-
-  bot.command("todos", async (ctx) => {
-    const repo = activeRepoName();
-    const sid = state.get().activeSessions[repo];
-    if (!sid) return push(ctx.chat.id, "No active session.");
-    const todos = await manager.get(repo).sessionTodo(sid);
-    await push(ctx.chat.id, `<b>[${esc(repo)}] Todos</b>\n${fmtTodos(todos)}`);
-  });
-
-  bot.command("cost", async (ctx) => {
-    const repo = activeRepoName();
-    const sid = state.get().activeSessions[repo];
-    if (!sid) return push(ctx.chat.id, "No active session.");
-    const s = await manager.get(repo).sessionDetail(sid);
-    await push(ctx.chat.id, `<b>[${esc(repo)}]</b> ${esc((s.title || "").slice(0, 50))}\n${fmtCost(s)}`);
-  });
+  bot.command("diff", (ctx) => doDiff(ctx.chat.id));
+  bot.command("todos", (ctx) => doTodos(ctx.chat.id));
+  bot.command("cost", (ctx) => doCost(ctx.chat.id));
 
   bot.command("share", async (ctx) => {
     const repo = activeRepoName();
@@ -725,29 +813,7 @@ function registerCommands() {
     await push(ctx.chat.id, "⏪ Reverted last turn.");
   });
 
-  bot.command("status", async (ctx) => {
-    const repo = activeRepoName();
-    const sid = state.get().activeSessions[repo];
-    let statusLine = "no active session";
-    let title = "-";
-    if (sid) {
-      try {
-        const sts = await manager.get(repo).sessionStatuses();
-        const st = sts[sid];
-        statusLine = st ? st.type : "idle";
-        const s = (await manager.get(repo).listSessions()).find((x) => x.id === sid);
-        title = s?.title || "-";
-      } catch {}
-    }
-    let version = "?";
-    try {
-      version = (await manager.get(repo).api("GET", "/global/health")).version;
-    } catch {}
-    await push(
-      ctx.chat.id,
-      `🟢 TeleCode bridge\nopencode: <code>${esc(version)}</code>\nrepo: <b>${esc(repo)}</b>\nsession: ${esc(title)}\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\nmodel: <b>${esc(state.get().activeModels[repo] || "default")}</b>\nagent: <b>${esc(state.get().activeAgents[repo] || "default")}</b>\npending asks: ${pendingAsks.size}`
-    );
-  });
+  bot.command("status", (ctx) => doStatus(ctx.chat.id));
 
   bot.command("pending", async (ctx) => {
     await announcePending();
@@ -759,6 +825,27 @@ function registerCallbacks() {
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data || "";
     try {
+      if (data.startsWith("mn|")) {
+        const [, action] = data.split("|");
+        console.log(`[cb] menu action: ${data}`);
+        const chatId = ctx.chat.id;
+        await ctx.answerCallbackQuery().catch(() => {});
+        switch (action) {
+          case "new": await askNewSession(chatId); break;
+          case "sessions": await sessionsList(chatId); break;
+          case "status": await doStatus(chatId); break;
+          case "mode": await doMode(chatId); break;
+          case "diff": await doDiff(chatId); break;
+          case "todos": await doTodos(chatId); break;
+          case "cost": await doCost(chatId); break;
+          case "abort": await doAbort(chatId); break;
+          case "model": await doModelInfo(chatId); break;
+          case "repo": await doRepoList(chatId); break;
+          case "help": await push(chatId, HELP_TEXT); break;
+          default: break;
+        }
+        return;
+      }
       if (data.startsWith("p|")) {
         const [, reqId, choice] = data.split("|");
         console.log(`[cb] permission answer: ${data}`);
@@ -954,6 +1041,7 @@ async function main() {
 
   await bot.init();
   await bot.api.setMyCommands([
+    { command: "menu", description: "Open the button menu" },
     { command: "new", description: "New session — asks what to do" },
     { command: "sessions", description: "List sessions (tap to switch)" },
     { command: "switch", description: "Switch to session n" },
@@ -973,11 +1061,15 @@ async function main() {
     { command: "help", description: "How to use" }
   ]);
 
-  await push(
-    ownerChat(),
-    `✅ TeleCode v2 is running.\nrepo: <b>${esc(activeRepoName())}</b> · streaming on · ${manager.instances.size} server${manager.instances.size === 1 ? "" : "s"}\n\nNew: /repo /model /agent /diff /todos /cost /share /revert — photos work too. /help for all.`
-  );
-  await announcePending();
+  if (currentOwner()) {
+    await push(
+      ownerChat(),
+      `✅ TeleCode is running.\nrepo: <b>${esc(activeRepoName())}</b> · streaming on · ${manager.instances.size} server${manager.instances.size === 1 ? "" : "s"}\n\nSend /menu for buttons, or just type what you want to build.`
+    );
+    await announcePending();
+  } else {
+    console.log("[bridge] no owner yet — PAIRING mode: first Telegram user to message the bot becomes the owner");
+  }
 
   await bot.start({ onStart: () => console.log("[bridge] telegram polling started") });
 }
