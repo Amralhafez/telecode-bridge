@@ -27,12 +27,12 @@
   "author": "Amr Alhafez",
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR_GITHUB_USERNAME/telecode-bridge.git"
+    "url": "https://github.com/Amralhafez/telecode-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR_GITHUB_USERNAME/telecode-bridge/issues"
+    "url": "https://github.com/Amralhafez/telecode-bridge/issues"
   },
-  "homepage": "https://github.com/YOUR_GITHUB_USERNAME/telecode-bridge#readme",
+  "homepage": "https://github.com/Amralhafez/telecode-bridge#readme",
   "dependencies": {
     "dotenv": "^17.2.3",
     "grammy": "^1.38.2"

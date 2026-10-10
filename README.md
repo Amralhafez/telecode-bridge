@@ -78,7 +78,7 @@ Runs on **Linux, macOS, and Windows**. GitHub features need the optional [`gh` C
 ## ⚡ Quick start
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/telecode-bridge.git
+git clone https://github.com/Amralhafez/telecode-bridge.git
 cd telecode-bridge
 npm install
 npm run setup      # interactive — writes your .env

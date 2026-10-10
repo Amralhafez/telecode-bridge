@@ -5,7 +5,7 @@ Thanks for your interest! Contributions of all sizes are welcome.
 ## Getting set up
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/telecode-bridge.git
+git clone https://github.com/Amralhafez/telecode-bridge.git
 cd telecode-bridge
 npm install
 npm run setup   # creates your .env (use a test bot)
