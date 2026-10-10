@@ -73,4 +73,41 @@ async function clone(url, targetDir) {
   await git(process.cwd(), ["clone", url, targetDir], { timeout: 300000 });
 }
 
-module.exports = { git, isRepo, changes, suggestMessage, commitAll, currentBranch, hasUpstream, push, clone };
+async function branches(dir) {
+  const { stdout } = await git(dir, ["branch", "--format=%(refname:short)"]);
+  const list = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  const current = await currentBranch(dir);
+  return { list, current };
+}
+
+async function checkout(dir, name) {
+  await git(dir, ["checkout", name]);
+}
+
+async function createBranch(dir, name) {
+  await git(dir, ["checkout", "-b", name]);
+}
+
+async function remoteUrl(dir) {
+  try {
+    const { stdout } = await git(dir, ["remote", "get-url", "origin"]);
+    return stdout.trim();
+  } catch {
+    return "";
+  }
+}
+
+// Build a "create PR" web URL for a GitHub remote + branch, else "".
+function prUrl(remote, branch) {
+  if (!remote) return "";
+  let m = remote.match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (!m) return "";
+  const owner = m[1];
+  const repo = m[2];
+  return `https://github.com/${owner}/${repo}/pull/new/${encodeURIComponent(branch)}`;
+}
+
+module.exports = {
+  git, isRepo, changes, suggestMessage, commitAll, currentBranch, hasUpstream, push, clone,
+  branches, checkout, createBranch, remoteUrl, prUrl
+};

@@ -21,7 +21,8 @@ const defaults = {
   yolo: {},
   schedules: [],
   allowedUsers: [],
-  budgetLimit: 0
+  budgetLimit: 0,
+  recentModels: []
 };
 
 let state = { ...defaults };
@@ -46,6 +47,7 @@ function migrate(data) {
   data.schedules = Array.isArray(data.schedules) ? data.schedules : [];
   data.allowedUsers = Array.isArray(data.allowedUsers) ? data.allowedUsers : [];
   data.budgetLimit = Number(data.budgetLimit) || 0;
+  data.recentModels = Array.isArray(data.recentModels) ? data.recentModels : [];
   if (!Object.keys(data.repos).length) {
     data.repos[DEFAULT_REPO] = { dir: DEFAULT_WORKSPACE, port: 4096 };
     delete data.activeSessionId;

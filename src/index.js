@@ -146,6 +146,7 @@ async function sendPrompt(chatId, parts, opts = {}) {
     return;
   }
   expectingTurn.add(turnKey(repo, sid));
+  startTyping(chatId);
 }
 
 async function onPermissionAsked(repo, p) {
@@ -290,8 +291,9 @@ async function onSessionIdle(repo, sessionID) {
     expectingTurn.delete(key);
     await push(ownerChat(), "✅ Finished (no text output).");
   }
+  stopTyping(ownerChat());
   await maybeBudgetAlert(repo, sessionID);
-  await offerGitActions(ownerChat());
+  await offerTurnControls(ownerChat());
 }
 
 function handleEvent(repo) {
@@ -540,13 +542,15 @@ const HELP_TEXT = [
 function menuKeyboard() {
   return new InlineKeyboard()
     .text("🆕 New", "mn|new").text("📋 Sessions", "mn|sessions").row()
-    .text("📊 Status", "mn|status").text("🎛 Mode", "mn|mode").row()
-    .text("🔁 Diff", "mn|diff").text("✅ Todos", "mn|todos").row()
-    .text("💰 Cost", "mn|cost").text("🛑 Abort", "mn|abort").row()
-    .text("🧠 Model", "mn|model").text("📁 Repos", "mn|repo").row()
     .text("🔀 Git", "mn|git").text("⚡ Templates", "mn|templates").row()
-    .text("📂 Files", "mn|files").text("🤖 YOLO", "mn|yolo").row()
-    .text("❓ Help", "mn|help");
+    .text("📂 Files", "mn|files").text("🌿 Branch", "mn|branch").row()
+    .text("🎛 Mode", "mn|mode").text("🤖 Agent", "mn|agent").row()
+    .text("🧠 Model", "mn|model").text("📁 Repos", "mn|repo").row()
+    .text("🔁 Diff", "mn|diff").text("✅ Todos", "mn|todos").row()
+    .text("💰 Cost", "mn|cost").text("📊 Usage", "mn|usage").row()
+    .text("⏰ Schedule", "mn|schedule").text("🔔 Pending", "mn|pending").row()
+    .text("⚡ YOLO", "mn|yolo").text("🛑 Abort", "mn|abort").row()
+    .text("📊 Status", "mn|status").text("❓ Help", "mn|help");
 }
 
 // A keyboard with just a Back-to-menu button (used by sub-panels).
@@ -649,21 +653,118 @@ async function modeView() {
   };
 }
 
+function rememberModel(m) {
+  if (!m) return;
+  const next = [m, ...state.get().recentModels.filter((x) => x !== m)].slice(0, 6);
+  state.set({ recentModels: next });
+}
+
 function modelView() {
   const repo = activeRepoName();
   const cur = state.get().activeModels[repo] || "(provider default)";
+  const recent = state.get().recentModels || [];
+  const kb = new InlineKeyboard();
+  recent.slice(0, 6).forEach((mdl, i) => {
+    kb.text(mdl.length > 30 ? "…" + mdl.slice(-29) : mdl, `ml|${i}`).row();
+  });
+  kb.text("⬅️ Menu", "mn|home");
   return {
-    html: `🧠 [${esc(repo)}] model: <b>${esc(cur)}</b>\n/model list [query] — browse\n/model provider/model — set\n/model clear — reset`,
-    kb: backKb()
+    html: `🧠 [${esc(repo)}] model: <b>${esc(cur)}</b>\n${recent.length ? "Tap a recent model below, or " : ""}/model list [query] — browse\n/model provider/model — set · /model clear`,
+    kb
   };
 }
 
 function reposView() {
   const repos = state.get().repos;
+  const active = state.get().activeRepo;
+  const names = Object.keys(repos);
+  const kb = new InlineKeyboard();
+  names.forEach((name, i) => {
+    kb.text(`${name === active ? "▶️ " : ""}${name}`, `rp|${name}`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (names.length % 2 === 1) kb.row();
+  kb.text("⬅️ Menu", "mn|home");
   const lines = Object.entries(repos).map(([name, r]) =>
-    `${name === state.get().activeRepo ? "▶️" : "•"} <b>${esc(name)}</b> — <code>${esc(r.dir)}</code> :${r.port}`
+    `${name === active ? "▶️" : "•"} <b>${esc(name)}</b> — <code>${esc(r.dir)}</code> :${r.port}`
   );
-  return { html: `<b>Repos</b>\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`, kb: backKb() };
+  return { html: `<b>Repos</b> — tap to switch\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`, kb };
+}
+
+async function agentView() {
+  const repo = activeRepoName();
+  const inst = manager.get(repo);
+  let agents = [];
+  try {
+    agents = await inst.api("GET", "/agent");
+  } catch {}
+  const cur = state.get().activeAgents[repo];
+  const top = agents.filter((a) => a.mode !== "subagent");
+  const kb = new InlineKeyboard();
+  top.slice(0, 10).forEach((a, i) => {
+    kb.text(`${a.name === cur ? "● " : ""}${a.name}`, `ag|${a.name}`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (top.length % 2 === 1) kb.row();
+  kb.text("⬅️ Menu", "mn|home");
+  return { html: `🤖 <b>Agent — ${esc(repo)}</b>\ncurrent: <b>${esc(cur || "default")}</b>\nTap to set:`, kb };
+}
+
+const lastBranches = new Map();
+async function branchView(chatId) {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  const kb = new InlineKeyboard();
+  if (!dir || !(await git.isRepo(dir))) {
+    kb.text("⬅️ Menu", "mn|home");
+    return { html: `🌿 <b>Branch — ${esc(repo)}</b>\n⚠️ Not a git repository.`, kb };
+  }
+  let info = { list: [], current: "" };
+  try {
+    info = await git.branches(dir);
+  } catch {}
+  lastBranches.set(chatId, info.list);
+  info.list.slice(0, 12).forEach((b, i) => {
+    kb.text(`${b === info.current ? "● " : ""}${b.slice(0, 24)}`, `br|co|${i}`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (info.list.length % 2 === 1) kb.row();
+  kb.text("➕ New branch", "br|new").row().text("⬅️ Menu", "mn|home");
+  return { html: `🌿 <b>Branch — ${esc(repo)}</b>\ncurrent: <b>${esc(info.current)}</b>\nTap to checkout:`, kb };
+}
+
+function scheduleView() {
+  const list = state.get().schedules;
+  const kb = new InlineKeyboard();
+  list.forEach((s) => kb.text(`🗑 ${s.spec} — ${s.repo}`, `sch|del|${s.id}`).row());
+  kb.text("⬅️ Menu", "mn|home");
+  const body = list.length
+    ? list.map((s) => `• <code>${esc(s.id)}</code> [${esc(s.repo)}] <b>${esc(s.spec)}</b>\n   ${esc(s.prompt.slice(0, 60))}`).join("\n")
+    : "None yet.";
+  return { html: `⏰ <b>Schedules</b>\n${body}\n\n/schedule add &lt;spec&gt; | &lt;prompt&gt;`, kb };
+}
+
+async function usageView() {
+  const repo = activeRepoName();
+  const inst = manager.get(repo);
+  let sessions = [];
+  try {
+    sessions = await inst.listSessions();
+  } catch {}
+  let cost = 0;
+  let tin = 0;
+  let tout = 0;
+  for (const s of sessions) {
+    if (typeof s.cost === "number") cost += s.cost;
+    const t = s.tokens || {};
+    tin += t.input || 0;
+    tout += t.output || 0;
+  }
+  const limit = state.get().budgetLimit;
+  return {
+    html: `📊 <b>Usage — ${esc(repo)}</b>\nsessions: <b>${sessions.length}</b>\ntotal cost: <b>$${cost.toFixed(4)}</b>\ntokens: ${tin} in / ${tout} out\nbudget alert: <b>${limit ? "$" + limit.toFixed(4) : "off"}</b>`,
+    kb: backKb()
+  };
 }
 
 async function statusView() {
@@ -784,10 +885,51 @@ async function doPush(chatId) {
   if (!g) return;
   try {
     const out = await git.push(g.dir);
-    await push(chatId, `🚀 Pushed.\n<code>${esc((out || "done").slice(-500))}</code>`);
+    const branch = await git.currentBranch(g.dir);
+    const url = git.prUrl(await git.remoteUrl(g.dir), branch);
+    const extra = url ? { reply_markup: new InlineKeyboard().url("🔀 Open PR", url) } : {};
+    await push(chatId, `🚀 Pushed <b>${esc(branch)}</b>.\n<code>${esc((out || "done").slice(-400))}</code>`, extra);
   } catch (e) {
     await push(chatId, `⚠️ Push failed: <code>${esc((e.stderr || e.message || "").slice(-500))}</code>`);
   }
+}
+
+// Typing indicator while the agent works (refcounted per chat).
+const typingTimers = new Map();
+function startTyping(chatId) {
+  const t = typingTimers.get(chatId);
+  if (t) {
+    t.count++;
+    return;
+  }
+  const send = () => bot.api.sendChatAction(chatId, "typing").catch(() => {});
+  send();
+  typingTimers.set(chatId, { timer: setInterval(send, 4500), count: 1 });
+}
+function stopTyping(chatId) {
+  const t = typingTimers.get(chatId);
+  if (!t) return;
+  t.count--;
+  if (t.count <= 0) {
+    clearInterval(t.timer);
+    typingTimers.delete(chatId);
+  }
+}
+
+// Compact control bar shown after a turn ends: Continue + Git (if changes) + Menu.
+async function offerTurnControls(chatId) {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  let changed = 0;
+  if (dir && (await git.isRepo(dir))) {
+    try {
+      changed = (await git.changes(dir)).length;
+    } catch {}
+  }
+  const kb = new InlineKeyboard().text("▶️ Continue", "cont");
+  if (changed) kb.text("🔀 Git", "mn|git");
+  kb.row().text("🏠 Menu", "mn|home");
+  await push(chatId, changed ? `✅ Done · <b>${changed}</b> change(s)` : "✅ Done", { reply_markup: kb });
 }
 
 async function doRevert(chatId) {
@@ -814,31 +956,6 @@ async function doFullDiffFile(chatId) {
   }
 }
 
-async function offerGitActions(chatId, { announceClean = false } = {}) {
-  const repo = activeRepoName();
-  const dir = repoDir(repo);
-  if (!dir || !(await git.isRepo(dir))) {
-    if (announceClean) await push(chatId, "⚠️ The active repo is not a git repository.");
-    return;
-  }
-  let changed = [];
-  try {
-    changed = await git.changes(dir);
-  } catch {
-    return;
-  }
-  if (!changed.length) {
-    if (announceClean) await push(chatId, `✅ Working tree clean in <b>${esc(repo)}</b> — nothing to commit.`);
-    return;
-  }
-  const kb = new InlineKeyboard()
-    .text("📥 Commit & push", "git|commitpush")
-    .text("🔁 Diff", "git|diff")
-    .row()
-    .text("📄 Diff file", "git|difffile")
-    .text("⏪ Revert turn", "git|revert");
-  await push(chatId, `🔀 <b>${changed.length}</b> uncommitted change(s) in <b>${esc(repo)}</b>.`, { reply_markup: kb });
-}
 
 // Git panel for the menu (always returns a view, with a Back button).
 async function gitView() {
@@ -1054,6 +1171,14 @@ function registerCommands() {
   bot.command("files", (ctx) => doFiles(ctx.chat.id, (ctx.match || "").trim() || "."));
   bot.command("export", (ctx) => doExport(ctx.chat.id));
   bot.command("templates", (ctx) => doTemplates(ctx.chat.id));
+  bot.command("branch", async (ctx) => {
+    const v = await branchView(ctx.chat.id);
+    await push(ctx.chat.id, v.html, { reply_markup: v.kb });
+  });
+  bot.command("usage", async (ctx) => {
+    const v = await usageView();
+    await push(ctx.chat.id, v.html, { reply_markup: v.kb });
+  });
   bot.command("clone", (ctx) => {
     const arg = (ctx.match || "").trim().split(/\s+/);
     doClone(ctx.chat.id, arg[0], arg[1]);
@@ -1262,6 +1387,7 @@ function registerCommands() {
       return;
     }
     state.set({ activeModels: { ...state.get().activeModels, [repo]: arg } });
+    rememberModel(arg);
     await push(ctx.chat.id, `🧠 [${esc(repo)}] Model set: <b>${esc(arg)}</b>`);
   });
 
@@ -1271,14 +1397,12 @@ function registerCommands() {
     const repo = activeRepoName();
     const inst = manager.get(repo);
     const arg = (ctx.match || "").trim();
-    const agents = await inst.api("GET", "/agent");
     if (!arg) {
-      await push(
-        ctx.chat.id,
-        `<b>Agents [${esc(repo)}]</b>\n${agents.map((a) => `${a.mode === "subagent" ? "▫️" : "•"} <code>${esc(a.name)}</code> <i>${esc(a.mode || "")}</i>`).join("\n")}\n\n/agent &lt;name&gt; — set`
-      );
+      const v = await agentView();
+      await push(ctx.chat.id, v.html, { reply_markup: v.kb });
       return;
     }
+    const agents = await inst.api("GET", "/agent");
     const found = agents.find((a) => a.name === arg);
     if (!found) {
       await push(ctx.chat.id, `⚠️ No agent named <code>${esc(arg)}</code>`);
@@ -1341,6 +1465,18 @@ function registerCallbacks() {
           case "cost": await showView(ctx, await costView()); break;
           case "model": await showView(ctx, modelView()); break;
           case "repo": await showView(ctx, reposView()); break;
+          case "agent": await showView(ctx, await agentView()); break;
+          case "branch": await showView(ctx, await branchView(chatId)); break;
+          case "schedule": await showView(ctx, scheduleView()); break;
+          case "usage": await showView(ctx, await usageView()); break;
+          case "pending": {
+            await announcePending();
+            await showView(ctx, {
+              html: pendingAsks.size ? `🔔 <b>${pendingAsks.size}</b> pending — answer via the buttons above.` : "✅ Nothing pending.",
+              kb: backKb()
+            });
+            break;
+          }
           case "git": await showView(ctx, await gitView()); break;
           case "templates": await showView(ctx, templatesView()); break;
           case "files": await showView(ctx, filesView(chatId, ".")); break;
@@ -1368,7 +1504,82 @@ function registerCallbacks() {
           await doPush(ctx.chat.id);
         } else if (act === "diff") await doDiff(ctx.chat.id);
         else if (act === "difffile") await doFullDiffFile(ctx.chat.id);
-        else if (act === "revert") await doRevert(ctx.chat.id);
+        else if (act === "revert") {
+          const kb = new InlineKeyboard().text("✅ Yes, revert", "git|revertyes").text("✖️ Cancel", "git|cancel");
+          await push(ctx.chat.id, "⏪ Revert the last turn? This undoes the last changes.", { reply_markup: kb });
+        } else if (act === "revertyes") await doRevert(ctx.chat.id);
+        else if (act === "cancel") await ctx.editMessageText("✖️ Cancelled.").catch(() => {});
+        return;
+      }
+      if (data.startsWith("rp|")) {
+        const [, name] = data.split("|");
+        console.log(`[cb] repo switch: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        if (state.get().repos[name]) state.set({ activeRepo: name });
+        await showView(ctx, reposView());
+        return;
+      }
+      if (data.startsWith("ag|")) {
+        const [, name] = data.split("|");
+        console.log(`[cb] agent set: ${data}`);
+        const repo = activeRepoName();
+        state.set({ activeAgents: { ...state.get().activeAgents, [repo]: name } });
+        await ctx.answerCallbackQuery({ text: `Agent: ${name}` }).catch(() => {});
+        await showView(ctx, await agentView());
+        return;
+      }
+      if (data.startsWith("ml|")) {
+        const [, iStr] = data.split("|");
+        console.log(`[cb] model pick: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        const mdl = state.get().recentModels[Number(iStr)];
+        if (mdl) {
+          const repo = activeRepoName();
+          state.set({ activeModels: { ...state.get().activeModels, [repo]: mdl } });
+          rememberModel(mdl);
+        }
+        await showView(ctx, modelView());
+        return;
+      }
+      if (data.startsWith("br|")) {
+        const [, act, iStr] = data.split("|");
+        console.log(`[cb] branch: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        const dir = repoDir(activeRepoName());
+        if (act === "new") {
+          pendingInput.set(ctx.chat.id, { type: "branch_new" });
+          await showView(ctx, { html: "🌿 <b>New branch</b>\nSend the branch name.\n\n<i>/cancel to abort.</i>", kb: backKb() });
+        } else if (act === "co") {
+          const list = lastBranches.get(ctx.chat.id) || [];
+          const name = list[Number(iStr)];
+          if (name && dir) {
+            try {
+              await git.checkout(dir, name);
+            } catch (e) {
+              await push(ctx.chat.id, `⚠️ Checkout failed: <code>${esc((e.stderr || e.message || "").slice(-300))}</code>`);
+            }
+          }
+          await showView(ctx, await branchView(ctx.chat.id));
+        }
+        return;
+      }
+      if (data.startsWith("sch|")) {
+        const [, act, id] = data.split("|");
+        console.log(`[cb] schedule: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        if (act === "del") {
+          const kb = new InlineKeyboard().text("✅ Delete", `sch|yes|${id}`).text("✖️ Cancel", "mn|schedule");
+          await showView(ctx, { html: `Delete schedule <code>${esc(id)}</code>?`, kb });
+        } else if (act === "yes") {
+          state.set({ schedules: state.get().schedules.filter((s) => s.id !== id) });
+          await showView(ctx, scheduleView());
+        }
+        return;
+      }
+      if (data === "cont") {
+        console.log("[cb] continue");
+        await ctx.answerCallbackQuery({ text: "Continuing…" }).catch(() => {});
+        await sendPrompt(ctx.chat.id, [{ type: "text", text: "Continue." }]);
         return;
       }
       if (data.startsWith("tpl|")) {
@@ -1495,6 +1706,21 @@ function registerMessages() {
       pendingInput.delete(chatId);
       if (pend.type === "new_session") {
         await startNewSession(chatId, text, { runAsPrompt: true });
+        return;
+      }
+      if (pend.type === "branch_new") {
+        const dir = repoDir(activeRepoName());
+        const name = text.trim().replace(/\s+/g, "-");
+        if (!dir || !(await git.isRepo(dir))) {
+          await push(chatId, "⚠️ The active repo is not a git repository.");
+          return;
+        }
+        try {
+          await git.createBranch(dir, name);
+          await push(chatId, `🌿 Created & switched to <b>${esc(name)}</b>.`);
+        } catch (e) {
+          await push(chatId, `⚠️ Could not create branch: <code>${esc((e.stderr || e.message || "").slice(-300))}</code>`);
+        }
         return;
       }
     }
@@ -1655,6 +1881,8 @@ async function main() {
     { command: "files", description: "Browse workspace files" },
     { command: "templates", description: "Quick-prompt buttons" },
     { command: "schedule", description: "Recurring prompts" },
+    { command: "branch", description: "Switch / create branch" },
+    { command: "usage", description: "Cost across sessions" },
     { command: "export", description: "Export transcript" },
     { command: "clone", description: "Clone a git repo" },
     { command: "budget", description: "Cost alert limit" },
