@@ -599,9 +599,10 @@ async function showView(ctx, view) {
   try {
     await ctx.editMessageText(view.html, { parse_mode: "HTML", reply_markup: view.kb });
   } catch (e) {
-    if (!String(e.message || "").includes("not modified")) {
-      await push(ctx.chat.id, view.html, { reply_markup: view.kb });
-    }
+    const msg = `${e.message || ""} ${e.description || ""}`;
+    if (msg.includes("not modified")) return; // already showing this exact view
+    console.error("[view] edit failed, sending fresh:", (e.description || e.message || "").slice(0, 120));
+    await push(ctx.chat.id, view.html, { reply_markup: view.kb });
   }
 }
 
@@ -878,7 +879,7 @@ async function doYolo(chatId) {
 }
 
 // ── Diagnostics: doctor / logs / grep ──────────────────────────────────
-async function doDoctor(chatId) {
+async function doctorView() {
   const lines = ["🩺 <b>Doctor</b>"];
   lines.push(`token: ${TOKEN ? "✅" : "❌ missing"}`);
   lines.push(`owner: ${currentOwner() ? "✅ " + esc(currentOwner()) : "⚠️ not paired yet"}`);
@@ -894,10 +895,15 @@ async function doDoctor(chatId) {
   lines.push(`GitHub CLI: ${(await gh.available()) ? "✅" : "not installed"}`);
   lines.push(`DND: ${state.get().dnd ? `${state.get().dnd.from}–${state.get().dnd.to}${quiet() ? " (quiet now)" : ""}` : "off"}`);
   lines.push(`budget: ${state.get().budgetLimit ? "$" + state.get().budgetLimit.toFixed(4) : "off"}`);
-  await push(chatId, lines.join("\n"), { reply_markup: backKb() });
+  return { html: lines.join("\n"), kb: backKb() };
 }
 
-async function doLogs(chatId) {
+async function doDoctor(chatId) {
+  const v = await doctorView();
+  await push(chatId, v.html, { reply_markup: v.kb });
+}
+
+function readLogsText() {
   const dir = path.join(__dirname, "..", "logs");
   const pick = [path.join(dir, "bridge-task.log")];
   const serve = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.startsWith("serve-") && f.endsWith(".log")) : [];
@@ -908,7 +914,18 @@ async function doLogs(chatId) {
       out += `\n===== ${path.basename(f)} =====\n` + files.tail(f, 25);
     } catch {}
   }
-  out = out.trim();
+  return out.trim();
+}
+
+function logsView() {
+  const out = readLogsText();
+  if (!out) return { html: "No logs yet.", kb: backKb() };
+  const shown = out.length > 3200 ? out.slice(-3200) : out;
+  return { html: `<pre><code>${esc(shown)}</code></pre>`, kb: backKb() };
+}
+
+async function doLogs(chatId) {
+  const out = readLogsText();
   if (!out) return push(chatId, "No logs yet.");
   if (out.length > 3500) {
     await sendDoc(chatId, "logs.txt", out, "Recent logs");
@@ -1168,19 +1185,25 @@ async function doClone(chatId, url, name) {
 }
 
 // ── GitHub (gh CLI) ────────────────────────────────────────────────────
-async function doCi(chatId) {
-  const g = await requireGit(chatId);
-  if (!g) return;
-  if (!(await gh.available())) return push(chatId, "⚠️ GitHub CLI (gh) is not installed or not on PATH.");
+async function ciView() {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  if (!dir || !(await git.isRepo(dir))) return { html: "⚠️ The active repo is not a git repository.", kb: backKb() };
+  if (!(await gh.available())) return { html: "⚠️ GitHub CLI (gh) is not installed or not on PATH.", kb: backKb() };
   try {
-    const runs = await gh.ciStatus(g.dir);
-    if (!runs.length) return push(chatId, "No workflow runs found.");
+    const runs = await gh.ciStatus(dir);
+    if (!runs.length) return { html: "🐙 <b>CI</b>\nNo workflow runs found.", kb: backKb() };
     const icon = (r) => (r.status !== "completed" ? "⏳" : r.conclusion === "success" ? "✅" : "❌");
     const lines = runs.map((r) => `${icon(r)} <b>${esc(r.workflowName || "")}</b> — ${esc(r.displayTitle || "")} <i>(${esc(r.conclusion || r.status)})</i>`);
-    await push(chatId, `🐙 <b>CI</b>\n${lines.join("\n")}`, { reply_markup: backKb() });
+    return { html: `🐙 <b>CI</b>\n${lines.join("\n")}`, kb: backKb() };
   } catch (e) {
-    await push(chatId, `⚠️ ${esc((e.stderr || e.message || "").slice(-300))}`);
+    return { html: `⚠️ ${esc((e.stderr || e.message || "").slice(-300))}`, kb: backKb() };
   }
+}
+
+async function doCi(chatId) {
+  const v = await ciView();
+  await push(chatId, v.html, { reply_markup: v.kb });
 }
 
 async function doPrs(chatId) {
@@ -1652,9 +1675,9 @@ function registerCallbacks() {
           case "git": await showView(ctx, await gitView()); break;
           case "templates": await showView(ctx, templatesView()); break;
           case "files": await showView(ctx, filesView(chatId, ".")); break;
-          case "doctor": await doDoctor(chatId); break;
-          case "ci": await doCi(chatId); break;
-          case "logs": await doLogs(chatId); break;
+          case "doctor": await showView(ctx, await doctorView()); break;
+          case "ci": await showView(ctx, await ciView()); break;
+          case "logs": await showView(ctx, logsView()); break;
           case "grep": pendingInput.set(chatId, { type: "grep" }); await showView(ctx, { html: "🔎 <b>Search</b>\nSend a pattern to search the workspace.\n\n<i>/cancel to abort.</i>", kb: backKb() }); break;
           case "yolo": await showView(ctx, yoloView()); break;
           case "yolotoggle": {
