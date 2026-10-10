@@ -105,7 +105,7 @@ async function notify(chatId, html, extra = {}) {
   return push(chatId, html, extra);
 }
 
-async function activeSession(repo) {
+async function activeSession(repo, titleHint) {
   const sid = state.get().activeSessions[repo];
   const inst = manager.get(repo);
   if (sid) {
@@ -114,7 +114,11 @@ async function activeSession(repo) {
       if (sessions.some((s) => s.id === sid)) return sid;
     } catch {}
   }
-  const s = await inst.createSession(`tg ${new Date().toISOString().slice(0, 16)}`);
+  // Name an auto-created session after the first prompt, else a timestamp.
+  const title = (titleHint && titleHint.trim())
+    ? titleHint.trim().split("\n")[0].slice(0, 60)
+    : `tg ${new Date().toISOString().slice(0, 16)}`;
+  const s = await inst.createSession(title);
   state.set({ activeSessions: { ...state.get().activeSessions, [repo]: s.id } });
   return s.id;
 }
@@ -151,7 +155,8 @@ async function sendPrompt(chatId, parts, opts = {}) {
     await push(chatId, "⚠️ No active repo — use /repo first.");
     return;
   }
-  const sid = await activeSession(repo);
+  const textHint = (parts.find((p) => p.type === "text") || {}).text;
+  const sid = await activeSession(repo, textHint);
   const view = new TurnView(bot, chatId);
   turnViews.set(turnKey(repo, sid), view);
   await view.ensureActivity();
@@ -1103,7 +1108,7 @@ function filesView(chatId, rel) {
   });
   if (listing.dirs.length % 2 === 1) kb.row();
   listing.files.forEach((f, i) => {
-    kb.text(`📄 ${f.slice(0, 24)}`, `fb|v|${i}`).text("⬇️", `fb|d|${i}`).row();
+    kb.text(`📄 ${f.slice(0, 22)}`, `fb|v|${i}`).text("⬇️", `fb|d|${i}`).text("🤖", `fb|a|${i}`).row();
   });
   kb.text("⬅️ Menu", "mn|home");
   const where = listing.rel === "." ? "" : listing.rel;
@@ -1791,6 +1796,9 @@ function registerCallbacks() {
         } else if (act === "o") {
           const name = b.dirs[Number(iStr)];
           if (name) await showView(ctx, filesView(ctx.chat.id, join(name)));
+        } else if (act === "a") {
+          const name = b.files[Number(iStr)];
+          if (name) await sendPrompt(ctx.chat.id, [{ type: "text", text: `Open and explain the file \`${join(name)}\`.` }]);
         } else if (act === "v" || act === "d") {
           const name = b.files[Number(iStr)];
           if (!name) return;
