@@ -26,6 +26,8 @@ Your coding agent usually lives in a terminal. TeleCode lets you kick off tasks,
 
 ## 🎬 In action
 
+<p align="center"><img src="docs/demo.svg" alt="TeleCode in action" width="680"></p>
+
 ```
 you  ▸  /new
 bot  ◂  🆕 New session — tell me what you want to do 👇
@@ -38,8 +40,6 @@ bot  ◂  ✅ Done · 3 change(s)   [ ▶️ Continue ] [ 🔀 Git ] [ 🏠 Menu
 you  ▸  (taps 🔀 Git → 📥 Commit & push)
 bot  ◂  🚀 Pushed feature/dark-mode.   [ 🔀 Open PR ] [ 🐙 CI ]
 ```
-
-> 💡 Add a screen recording or screenshots here before sharing — `docs/demo.gif`.
 
 ## 🚀 Features
 

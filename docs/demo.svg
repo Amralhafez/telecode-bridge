@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 540" font-family="'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+  <style>
+    .scr { fill:#0e1621; }
+    .hdr { fill:#17212b; }
+    .uname { fill:#e8edf2; font-size:15px; font-weight:600; }
+    .ustat { fill:#6ab7ff; font-size:11px; }
+    .bot { fill:#182533; }
+    .usr { fill:#2b5278; }
+    .txt { fill:#e8edf2; font-size:13.5px; }
+    .mut { fill:#8aa0b2; font-size:12px; }
+    .btn { fill:#223141; }
+    .btntx { fill:#6ab7ff; font-size:11.5px; font-weight:600; }
+    .avatar { fill:#2b5278; }
+    .av2 { fill:#3f5bd1; }
+    g.b { opacity:0; }
+    .b1{animation:k1 16s ease-out infinite;} .b2{animation:k2 16s ease-out infinite;}
+    .b3{animation:k3 16s ease-out infinite;} .b4{animation:k4 16s ease-out infinite;}
+    .b5{animation:k5 16s ease-out infinite;} .b6{animation:k6 16s ease-out infinite;}
+    .b7{animation:k7 16s ease-out infinite;} .b8{animation:k8 16s ease-out infinite;}
+    @keyframes k1{0%,4%{opacity:0;transform:translateY(10px)}7%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+    @keyframes k2{0%,12%{opacity:0;transform:translateY(10px)}15%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+    @keyframes k3{0%,20%{opacity:0;transform:translateY(10px)}23%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+    @keyframes k4{0%,30%{opacity:0;transform:translateY(10px)}33%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+    @keyframes k5{0%,42%{opacity:0;transform:translateY(10px)}45%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+    @keyframes k6{0%,56%{opacity:0;transform:translateY(10px)}59%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+    @keyframes k7{0%,68%{opacity:0;transform:translateY(10px)}71%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+    @keyframes k8{0%,80%{opacity:0;transform:translateY(10px)}83%,93%{opacity:1;transform:translateY(0)}99%,100%{opacity:0}}
+  </style>
+
+  <rect class="scr" x="0" y="0" width="760" height="540" rx="14"/>
+  <!-- header -->
+  <rect class="hdr" x="0" y="0" width="760" height="52" rx="14"/>
+  <rect class="hdr" x="0" y="20" width="760" height="32"/>
+  <circle class="avatar" cx="30" cy="26" r="15"/>
+  <text x="30" y="31" text-anchor="middle" class="txt" font-weight="700">🤖</text>
+  <text x="56" y="22" class="uname">TeleCode</text>
+  <text x="56" y="39" class="ustat">bot · online</text>
+
+  <!-- b1 user /new -->
+  <g class="b b1">
+    <rect class="usr" x="560" y="66" width="180" height="30" rx="12"/>
+    <text x="574" y="86" class="txt">/new</text>
+  </g>
+  <!-- b2 bot ask -->
+  <g class="b b2">
+    <rect class="bot" x="20" y="104" width="420" height="30" rx="12"/>
+    <text x="34" y="124" class="txt">🆕 New session — what do you want to do? 👇</text>
+  </g>
+  <!-- b3 user prompt -->
+  <g class="b b3">
+    <rect class="usr" x="420" y="142" width="320" height="30" rx="12"/>
+    <text x="434" y="162" class="txt">add a dark-mode toggle to settings</text>
+  </g>
+  <!-- b4 bot activity -->
+  <g class="b b4">
+    <rect class="bot" x="20" y="180" width="300" height="30" rx="12"/>
+    <text x="34" y="200" class="mut">🛠 4 tool calls · ⏱ 12s</text>
+  </g>
+  <!-- b5 bot permission + buttons -->
+  <g class="b b5">
+    <rect class="bot" x="20" y="218" width="430" height="58" rx="12"/>
+    <text x="34" y="238" class="txt">🔐 Permission: <tspan fill="#9fb3c4">bash · npm run build</tspan></text>
+    <rect class="btn" x="34" y="247" width="92" height="22" rx="7"/><text x="80" y="262" text-anchor="middle" class="btntx">✅ Once</text>
+    <rect class="btn" x="132" y="247" width="96" height="22" rx="7"/><text x="180" y="262" text-anchor="middle" class="btntx">🔁 Always</text>
+    <rect class="btn" x="234" y="247" width="88" height="22" rx="7"/><text x="278" y="262" text-anchor="middle" class="btntx">❌ Deny</text>
+  </g>
+  <!-- b6 bot reply -->
+  <g class="b b6">
+    <rect class="bot" x="20" y="284" width="470" height="30" rx="12"/>
+    <text x="34" y="304" class="txt">Added a ThemeToggle and wired it to localStorage.</text>
+  </g>
+  <!-- b7 done + controls -->
+  <g class="b b7">
+    <rect class="bot" x="20" y="322" width="360" height="58" rx="12"/>
+    <text x="34" y="342" class="txt">✅ Done · <tspan font-weight="700">3</tspan> change(s)</text>
+    <rect class="btn" x="34" y="351" width="104" height="22" rx="7"/><text x="86" y="366" text-anchor="middle" class="btntx">▶️ Continue</text>
+    <rect class="btn" x="144" y="351" width="70" height="22" rx="7"/><text x="179" y="366" text-anchor="middle" class="btntx">🔀 Git</text>
+    <rect class="btn" x="220" y="351" width="80" height="22" rx="7"/><text x="260" y="366" text-anchor="middle" class="btntx">🏠 Menu</text>
+  </g>
+  <!-- b8 pushed + PR -->
+  <g class="b b8">
+    <rect class="bot" x="20" y="388" width="340" height="58" rx="12"/>
+    <text x="34" y="408" class="txt">🚀 Pushed <tspan font-weight="700">feature/dark-mode</tspan></text>
+    <rect class="btn" x="34" y="417" width="104" height="22" rx="7"/><text x="86" y="432" text-anchor="middle" class="btntx">🔀 Open PR</text>
+    <rect class="btn" x="144" y="417" width="60" height="22" rx="7"/><text x="174" y="432" text-anchor="middle" class="btntx">🐙 CI</text>
+  </g>
+
+  <!-- input bar -->
+  <rect class="hdr" x="0" y="500" width="760" height="40"/>
+  <rect x="16" y="508" width="680" height="24" rx="12" fill="#0e1621"/>
+  <text x="30" y="524" class="mut">Message…  🎙</text>
+  <circle class="av2" cx="726" cy="520" r="14"/>
+  <path d="M720 520 l12 -5 -4 5 4 5 z" fill="#fff"/>
+</svg>
