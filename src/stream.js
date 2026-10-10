@@ -31,6 +31,7 @@ class TurnView {
   constructor(bot, chatId) {
     this.bot = bot;
     this.chatId = chatId;
+    this.startTime = Date.now();
     this.activityId = null;
     this.replyId = null;
     this.tools = [];
@@ -56,7 +57,9 @@ class TurnView {
   activityText() {
     const shown = this.tools.slice(-3);
     const extra = this.tools.length - shown.length;
-    const lines = [`🛠 ${this.tools.length} tool call${this.tools.length === 1 ? "" : "s"}`];
+    const secs = Math.round((Date.now() - this.startTime) / 1000);
+    const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+    const lines = [`🛠 ${this.tools.length} tool call${this.tools.length === 1 ? "" : "s"} · ⏱ ${elapsed}`];
     for (const t of shown) lines.push(`🔨 ${t}`);
     if (extra > 0) lines.push(`… +${extra} earlier`);
     return lines.join("\n");

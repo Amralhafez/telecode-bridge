@@ -52,4 +52,33 @@ function isProbablyText(buffer) {
   return true;
 }
 
-module.exports = { resolveIn, relOf, list, readFile, isProbablyText, MAX_VIEW_BYTES };
+// Read the last `n` lines of a file (for /logs).
+function tail(file, n = 40) {
+  const data = fs.readFileSync(file, "utf8");
+  const lines = data.split(/\r?\n/);
+  return lines.slice(-n).join("\n");
+}
+
+// Search the workspace. Prefers ripgrep, falls back to `git grep`.
+const { execFile } = require("child_process");
+function search(root, pattern) {
+  return new Promise((resolve) => {
+    const done = (text, tool) => resolve({ text: (text || "").slice(0, 3500), tool });
+    execFile(
+      "rg",
+      ["--line-number", "--no-heading", "--color", "never", "--max-count", "5", "-S", pattern],
+      { cwd: root, timeout: 20000, maxBuffer: 5 * 1024 * 1024, windowsHide: true },
+      (err, stdout) => {
+        if (!err || stdout) return done(stdout, "rg");
+        execFile(
+          "git",
+          ["grep", "-n", "-I", "--heading", "-e", pattern],
+          { cwd: root, timeout: 20000, maxBuffer: 5 * 1024 * 1024, windowsHide: true },
+          (e2, out2) => done(out2, "git grep")
+        );
+      }
+    );
+  });
+}
+
+module.exports = { resolveIn, relOf, list, readFile, isProbablyText, tail, search, MAX_VIEW_BYTES };

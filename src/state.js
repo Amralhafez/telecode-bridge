@@ -22,7 +22,8 @@ const defaults = {
   schedules: [],
   allowedUsers: [],
   budgetLimit: 0,
-  recentModels: []
+  recentModels: [],
+  dnd: null
 };
 
 let state = { ...defaults };
@@ -48,6 +49,7 @@ function migrate(data) {
   data.allowedUsers = Array.isArray(data.allowedUsers) ? data.allowedUsers : [];
   data.budgetLimit = Number(data.budgetLimit) || 0;
   data.recentModels = Array.isArray(data.recentModels) ? data.recentModels : [];
+  data.dnd = data.dnd && typeof data.dnd === "object" ? data.dnd : null;
   if (!Object.keys(data.repos).length) {
     data.repos[DEFAULT_REPO] = { dir: DEFAULT_WORKSPACE, port: 4096 };
     delete data.activeSessionId;

@@ -10,6 +10,7 @@ const media = require("./media");
 const stt = require("./stt");
 const git = require("./git");
 const files = require("./files");
+const gh = require("./gh");
 
 const OWNER_ENV = String(process.env.TELEGRAM_OWNER_ID || "");
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
@@ -82,6 +83,26 @@ async function sendDoc(chatId, filename, content, caption) {
 
 function repoDir(repo) {
   return state.get().repos[repo]?.dir;
+}
+
+// Quiet hours: true when now is inside the configured DND window. Used to
+// suppress bot-initiated noise (control bars, alerts) — never replies.
+function quiet() {
+  const d = state.get().dnd;
+  if (!d || !d.from || !d.to) return false;
+  const now = new Date();
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const [fh, fm] = d.from.split(":").map(Number);
+  const [th, tm] = d.to.split(":").map(Number);
+  const from = fh * 60 + fm;
+  const to = th * 60 + tm;
+  return from <= to ? cur >= from && cur < to : cur >= from || cur < to;
+}
+
+// Proactive notification — skipped during quiet hours.
+async function notify(chatId, html, extra = {}) {
+  if (quiet()) return [];
+  return push(chatId, html, extra);
 }
 
 async function activeSession(repo) {
@@ -277,7 +298,7 @@ async function onSessionStatus(repo, { sessionID, status }) {
   const key = `${repo}|${sessionID}`;
   if (retryNotified.has(key)) return;
   retryNotified.add(key);
-  await push(ownerChat(), `⚠️ [${repo}] Provider retry (attempt ${status.attempt}): ${esc((status.message || "").slice(0, 200))}`);
+  await notify(ownerChat(), `⚠️ [${repo}] Provider retry (attempt ${status.attempt}): ${esc((status.message || "").slice(0, 200))}`);
 }
 
 async function onSessionIdle(repo, sessionID) {
@@ -293,7 +314,7 @@ async function onSessionIdle(repo, sessionID) {
   }
   stopTyping(ownerChat());
   await maybeBudgetAlert(repo, sessionID);
-  await offerTurnControls(ownerChat());
+  if (!quiet()) await offerTurnControls(ownerChat());
 }
 
 function handleEvent(repo) {
@@ -550,7 +571,9 @@ function menuKeyboard() {
     .text("💰 Cost", "mn|cost").text("📊 Usage", "mn|usage").row()
     .text("⏰ Schedule", "mn|schedule").text("🔔 Pending", "mn|pending").row()
     .text("⚡ YOLO", "mn|yolo").text("🛑 Abort", "mn|abort").row()
-    .text("📊 Status", "mn|status").text("❓ Help", "mn|help");
+    .text("🩺 Doctor", "mn|doctor").text("📜 Logs", "mn|logs").row()
+    .text("🔎 Grep", "mn|grep").text("📊 Status", "mn|status").row()
+    .text("❓ Help", "mn|help");
 }
 
 // A keyboard with just a Back-to-menu button (used by sub-panels).
@@ -849,6 +872,55 @@ async function doYolo(chatId) {
   );
 }
 
+// ── Diagnostics: doctor / logs / grep ──────────────────────────────────
+async function doDoctor(chatId) {
+  const lines = ["🩺 <b>Doctor</b>"];
+  lines.push(`token: ${TOKEN ? "✅" : "❌ missing"}`);
+  lines.push(`owner: ${currentOwner() ? "✅ " + esc(currentOwner()) : "⚠️ not paired yet"}`);
+  for (const [name, r] of Object.entries(state.get().repos)) {
+    const exists = r.dir && fs.existsSync(r.dir);
+    let healthy = false;
+    try {
+      healthy = Boolean(await manager.get(name)?.healthy(2500));
+    } catch {}
+    lines.push(`repo <b>${esc(name)}</b>: dir ${exists ? "✅" : "❌"} · opencode ${healthy ? "✅ :" + r.port : "❌"}`);
+  }
+  lines.push(`voice (STT): ${stt.enabled() ? "✅ configured" : "off"}`);
+  lines.push(`GitHub CLI: ${(await gh.available()) ? "✅" : "not installed"}`);
+  lines.push(`DND: ${state.get().dnd ? `${state.get().dnd.from}–${state.get().dnd.to}${quiet() ? " (quiet now)" : ""}` : "off"}`);
+  lines.push(`budget: ${state.get().budgetLimit ? "$" + state.get().budgetLimit.toFixed(4) : "off"}`);
+  await push(chatId, lines.join("\n"), { reply_markup: backKb() });
+}
+
+async function doLogs(chatId) {
+  const dir = path.join(__dirname, "..", "logs");
+  const pick = [path.join(dir, "bridge-task.log")];
+  const serve = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.startsWith("serve-") && f.endsWith(".log")) : [];
+  if (serve.length) pick.push(path.join(dir, serve[0]));
+  let out = "";
+  for (const f of pick) {
+    try {
+      out += `\n===== ${path.basename(f)} =====\n` + files.tail(f, 25);
+    } catch {}
+  }
+  out = out.trim();
+  if (!out) return push(chatId, "No logs yet.");
+  if (out.length > 3500) {
+    await sendDoc(chatId, "logs.txt", out, "Recent logs");
+  } else {
+    await push(chatId, `<pre><code>${esc(out)}</code></pre>`, { reply_markup: backKb() });
+  }
+}
+
+async function doGrep(chatId, pattern) {
+  if (!pattern) return push(chatId, "Usage: /grep &lt;pattern&gt;");
+  const dir = repoDir(activeRepoName());
+  if (!dir) return push(chatId, "⚠️ No active repo.");
+  const { text, tool } = await files.search(dir, pattern);
+  if (!text) return push(chatId, `🔎 No matches for <code>${esc(pattern)}</code>.`);
+  await push(chatId, `🔎 <b>${esc(pattern)}</b> <i>(${tool})</i>\n<pre><code>${esc(text)}</code></pre>`, { reply_markup: backKb() });
+}
+
 // ── Git actions ────────────────────────────────────────────────────────
 async function requireGit(chatId) {
   const repo = activeRepoName();
@@ -887,7 +959,10 @@ async function doPush(chatId) {
     const out = await git.push(g.dir);
     const branch = await git.currentBranch(g.dir);
     const url = git.prUrl(await git.remoteUrl(g.dir), branch);
-    const extra = url ? { reply_markup: new InlineKeyboard().url("🔀 Open PR", url) } : {};
+    const kb = new InlineKeyboard();
+    if (url) kb.url("🔀 Open PR", url);
+    if (await gh.available()) kb.text("🐙 CI", "mn|ci");
+    const extra = url || (await gh.available()) ? { reply_markup: kb } : {};
     await push(chatId, `🚀 Pushed <b>${esc(branch)}</b>.\n<code>${esc((out || "done").slice(-400))}</code>`, extra);
   } catch (e) {
     await push(chatId, `⚠️ Push failed: <code>${esc((e.stderr || e.message || "").slice(-500))}</code>`);
@@ -1087,6 +1162,70 @@ async function doClone(chatId, url, name) {
   await push(chatId, `✅ Cloned & active: <b>${esc(safe)}</b>\n<code>${esc(target)}</code> :${port}`);
 }
 
+// ── GitHub (gh CLI) ────────────────────────────────────────────────────
+async function doCi(chatId) {
+  const g = await requireGit(chatId);
+  if (!g) return;
+  if (!(await gh.available())) return push(chatId, "⚠️ GitHub CLI (gh) is not installed or not on PATH.");
+  try {
+    const runs = await gh.ciStatus(g.dir);
+    if (!runs.length) return push(chatId, "No workflow runs found.");
+    const icon = (r) => (r.status !== "completed" ? "⏳" : r.conclusion === "success" ? "✅" : "❌");
+    const lines = runs.map((r) => `${icon(r)} <b>${esc(r.workflowName || "")}</b> — ${esc(r.displayTitle || "")} <i>(${esc(r.conclusion || r.status)})</i>`);
+    await push(chatId, `🐙 <b>CI</b>\n${lines.join("\n")}`, { reply_markup: backKb() });
+  } catch (e) {
+    await push(chatId, `⚠️ ${esc((e.stderr || e.message || "").slice(-300))}`);
+  }
+}
+
+async function doPrs(chatId) {
+  const g = await requireGit(chatId);
+  if (!g) return;
+  if (!(await gh.available())) return push(chatId, "⚠️ GitHub CLI (gh) is not installed or not on PATH.");
+  try {
+    const prs = await gh.listPRs(g.dir);
+    if (!prs.length) return push(chatId, "No open pull requests.");
+    const lines = prs.map((p) => `#${p.number} <b>${esc(p.title)}</b> <i>(${esc(p.headRefName)})</i>`);
+    await push(chatId, `🐙 <b>Pull requests</b>\n${lines.join("\n")}`, { reply_markup: backKb() });
+  } catch (e) {
+    await push(chatId, `⚠️ ${esc((e.stderr || e.message || "").slice(-300))}`);
+  }
+}
+
+async function doIssue(chatId, title) {
+  const g = await requireGit(chatId);
+  if (!g) return;
+  if (!title) return push(chatId, "Usage: /issue &lt;title&gt;");
+  if (!(await gh.available())) return push(chatId, "⚠️ GitHub CLI (gh) is not installed or not on PATH.");
+  try {
+    const url = await gh.createIssue(g.dir, title, "");
+    await push(chatId, `🐙 Issue created:\n${esc(url)}`);
+  } catch (e) {
+    await push(chatId, `⚠️ ${esc((e.stderr || e.message || "").slice(-300))}`);
+  }
+}
+
+// ── Raw shell (owner only, confirmed) ──────────────────────────────────
+const pendingShell = new Map();
+async function doShConfirm(chatId, cmd) {
+  if (!cmd) return push(chatId, "Usage: /sh &lt;command&gt;");
+  pendingShell.set(chatId, cmd);
+  const kb = new InlineKeyboard().text("✅ Run", "sh|yes").text("✖️ Cancel", "sh|no");
+  await push(chatId, `🖥 Run in <b>${esc(activeRepoName())}</b>?\n<pre><code>${esc(cmd)}</code></pre>`, { reply_markup: kb });
+}
+async function doShRun(chatId) {
+  const cmd = pendingShell.get(chatId);
+  pendingShell.delete(chatId);
+  if (!cmd) return;
+  const dir = repoDir(activeRepoName()) || process.cwd();
+  const { exec } = require("child_process");
+  exec(cmd, { cwd: dir, timeout: 60000, maxBuffer: 2 * 1024 * 1024, windowsHide: true }, async (err, stdout, stderr) => {
+    const out = ((stdout || "") + (stderr || "")).trim() || (err ? err.message : "(no output)");
+    if (out.length > 3500) await sendDoc(chatId, "sh-output.txt", out, cmd);
+    else await push(chatId, `🖥 <code>${esc(cmd)}</code>\n<pre><code>${esc(out)}</code></pre>`);
+  });
+}
+
 // ── Budget alert ───────────────────────────────────────────────────────
 const budgetNotified = new Set();
 async function maybeBudgetAlert(repo, sid) {
@@ -1098,7 +1237,12 @@ async function maybeBudgetAlert(repo, sid) {
     const s = await manager.get(repo).sessionDetail(sid);
     if ((s.cost || 0) >= limit) {
       budgetNotified.add(key);
-      await push(ownerChat(), `⚠️ <b>Budget alert</b> — [${esc(repo)}] session cost $${(s.cost || 0).toFixed(4)} ≥ limit $${limit.toFixed(4)}.`);
+      let aborted = "";
+      try {
+        await manager.get(repo).abortSession(sid);
+        aborted = "\n🛑 Session aborted to stop further spend.";
+      } catch {}
+      await push(ownerChat(), `⚠️ <b>Budget limit hit</b> — [${esc(repo)}] session cost $${(s.cost || 0).toFixed(4)} ≥ $${limit.toFixed(4)}.${aborted}`);
     }
   } catch {}
 }
@@ -1151,7 +1295,7 @@ function startScheduler() {
       changedState = true;
       try {
         if (sc.repo && state.get().repos[sc.repo]) state.set({ activeRepo: sc.repo });
-        await push(ownerChat(), `⏰ Scheduled run [${esc(sc.repo)}]: <code>${esc(sc.prompt.slice(0, 80))}</code>`);
+        await notify(ownerChat(), `⏰ Scheduled run [${esc(sc.repo)}]: <code>${esc(sc.prompt.slice(0, 80))}</code>`);
         await sendPrompt(ownerChat(), [{ type: "text", text: sc.prompt }]);
       } catch (e) {
         console.error("[sched] fire failed:", e.message);
@@ -1178,6 +1322,29 @@ function registerCommands() {
   bot.command("usage", async (ctx) => {
     const v = await usageView();
     await push(ctx.chat.id, v.html, { reply_markup: v.kb });
+  });
+  bot.command("doctor", (ctx) => doDoctor(ctx.chat.id));
+  bot.command("logs", (ctx) => doLogs(ctx.chat.id));
+  bot.command("grep", (ctx) => doGrep(ctx.chat.id, (ctx.match || "").trim()));
+  bot.command("ci", (ctx) => doCi(ctx.chat.id));
+  bot.command("prs", (ctx) => doPrs(ctx.chat.id));
+  bot.command("issue", (ctx) => doIssue(ctx.chat.id, (ctx.match || "").trim()));
+  bot.command("sh", (ctx) => doShConfirm(ctx.chat.id, (ctx.match || "").trim()));
+
+  bot.command("dnd", async (ctx) => {
+    const arg = (ctx.match || "").trim().toLowerCase();
+    if (!arg) {
+      const d = state.get().dnd;
+      return push(ctx.chat.id, `🌙 DND: <b>${d ? `${d.from}–${d.to}` : "off"}</b>\n/dnd 23:00-08:00 — set · /dnd off`);
+    }
+    if (arg === "off") {
+      state.set({ dnd: null });
+      return push(ctx.chat.id, "🌙 DND off.");
+    }
+    const m = arg.match(/^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/);
+    if (!m) return push(ctx.chat.id, "Usage: /dnd 23:00-08:00 (or /dnd off)");
+    state.set({ dnd: { from: m[1], to: m[2] } });
+    await push(ctx.chat.id, `🌙 DND set: <b>${esc(m[1])}–${esc(m[2])}</b> — proactive alerts muted in that window.`);
   });
   bot.command("clone", (ctx) => {
     const arg = (ctx.match || "").trim().split(/\s+/);
@@ -1480,6 +1647,10 @@ function registerCallbacks() {
           case "git": await showView(ctx, await gitView()); break;
           case "templates": await showView(ctx, templatesView()); break;
           case "files": await showView(ctx, filesView(chatId, ".")); break;
+          case "doctor": await doDoctor(chatId); break;
+          case "ci": await doCi(chatId); break;
+          case "logs": await doLogs(chatId); break;
+          case "grep": pendingInput.set(chatId, { type: "grep" }); await showView(ctx, { html: "🔎 <b>Search</b>\nSend a pattern to search the workspace.\n\n<i>/cancel to abort.</i>", kb: backKb() }); break;
           case "yolo": await showView(ctx, yoloView()); break;
           case "yolotoggle": {
             const repo = activeRepoName();
@@ -1580,6 +1751,19 @@ function registerCallbacks() {
         console.log("[cb] continue");
         await ctx.answerCallbackQuery({ text: "Continuing…" }).catch(() => {});
         await sendPrompt(ctx.chat.id, [{ type: "text", text: "Continue." }]);
+        return;
+      }
+      if (data.startsWith("sh|")) {
+        const [, act] = data.split("|");
+        console.log(`[cb] sh: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        if (act === "yes") {
+          await ctx.editMessageText("🖥 Running…").catch(() => {});
+          await doShRun(ctx.chat.id);
+        } else {
+          pendingShell.delete(ctx.chat.id);
+          await ctx.editMessageText("✖️ Cancelled.").catch(() => {});
+        }
         return;
       }
       if (data.startsWith("tpl|")) {
@@ -1706,6 +1890,10 @@ function registerMessages() {
       pendingInput.delete(chatId);
       if (pend.type === "new_session") {
         await startNewSession(chatId, text, { runAsPrompt: true });
+        return;
+      }
+      if (pend.type === "grep") {
+        await doGrep(chatId, text);
         return;
       }
       if (pend.type === "branch_new") {
@@ -1844,7 +2032,9 @@ async function main() {
     manager.register(name, r.dir, r.port);
   }
   await manager.ensureAll();
-  manager.startWatchdog();
+  manager.startWatchdog((name) => {
+    notify(ownerChat(), `🔁 opencode[${esc(name)}] crashed and was restarted by the watchdog.`);
+  });
   startReconcile();
   startScheduler();
   for (const [name, inst] of manager.instances) {
@@ -1885,8 +2075,16 @@ async function main() {
     { command: "usage", description: "Cost across sessions" },
     { command: "export", description: "Export transcript" },
     { command: "clone", description: "Clone a git repo" },
-    { command: "budget", description: "Cost alert limit" },
+    { command: "budget", description: "Cost limit (auto-abort)" },
     { command: "team", description: "Manage allowed users" },
+    { command: "doctor", description: "Self health check" },
+    { command: "logs", description: "Recent logs" },
+    { command: "grep", description: "Search the workspace" },
+    { command: "ci", description: "GitHub CI status" },
+    { command: "prs", description: "List pull requests" },
+    { command: "issue", description: "Create a GitHub issue" },
+    { command: "dnd", description: "Quiet hours" },
+    { command: "sh", description: "Run a shell command" },
     { command: "share", description: "Get share URL" },
     { command: "revert", description: "Undo last turn" },
     { command: "pending", description: "Pending approvals/questions" },

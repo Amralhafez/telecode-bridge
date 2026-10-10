@@ -232,7 +232,7 @@ class ServerManager {
     for (const s of this.instances.values()) await s.ensure();
   }
 
-  startWatchdog() {
+  startWatchdog(onRespawn) {
     let busy = false;
     setInterval(async () => {
       if (busy) return;
@@ -244,6 +244,11 @@ class ServerManager {
           try {
             await s.spawn();
             console.log(`[oc:${s.name}] watchdog: server back`);
+            if (typeof onRespawn === "function") {
+              try {
+                onRespawn(s.name);
+              } catch {}
+            }
           } catch (e) {
             console.error(`[oc:${s.name}] watchdog respawn failed:`, e.message);
           }
