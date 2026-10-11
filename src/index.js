@@ -11,6 +11,7 @@ const stt = require("./stt");
 const git = require("./git");
 const files = require("./files");
 const gh = require("./gh");
+const cliagent = require("./cliagent");
 
 const OWNER_ENV = String(process.env.TELEGRAM_OWNER_ID || "");
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
@@ -85,6 +86,14 @@ function repoDir(repo) {
   return state.get().repos[repo]?.dir;
 }
 
+// Which agent backend drives a repo: "opencode" (default), "claude", or "codex".
+function repoEngine(repo) {
+  return state.get().engines[repo] || "opencode";
+}
+
+const ENGINE_LABEL = { opencode: "opencode", claude: "Claude Code", codex: "Codex" };
+const cliChildren = new Map(); // chatId -> child process of an in-flight CLI run
+
 // Quiet hours: true when now is inside the configured DND window. Used to
 // suppress bot-initiated noise (control bars, alerts) — never replies.
 function quiet() {
@@ -129,6 +138,14 @@ function turnKey(repo, sid) {
 
 async function startNewSession(chatId, text, { runAsPrompt = false } = {}) {
   const repo = activeRepoName();
+  const engine = repoEngine(repo);
+  if (engine !== "opencode") {
+    // CLI agents: a "new session" just means start fresh next prompt.
+    state.set({ cliSessions: { ...state.get().cliSessions, [repo]: undefined } });
+    await push(chatId, `🆕 [${esc(repo)}] New <b>${esc(ENGINE_LABEL[engine])}</b> session.`);
+    if (runAsPrompt && text && text.trim()) await runCliAgent(chatId, repo, engine, text.trim());
+    return null;
+  }
   const inst = manager.get(repo);
   if (!inst) {
     await push(chatId, "⚠️ No active repo — use /repo first.");
@@ -148,8 +165,72 @@ async function startNewSession(chatId, text, { runAsPrompt = false } = {}) {
   return s;
 }
 
+async function runCliAgent(chatId, repo, engine, text) {
+  const dir = repoDir(repo);
+  if (!dir) return push(chatId, "⚠️ No active repo.");
+  if (!(await cliagent.has(engine === "claude" ? "claude" : "codex"))) {
+    return push(chatId, `⚠️ <b>${esc(ENGINE_LABEL[engine])}</b> CLI is not installed or not on PATH.`);
+  }
+  const yolo = Boolean(state.get().yolo[repo]);
+  const sid = state.get().cliSessions[repo];
+  const view = new TurnView(bot, chatId);
+  await view.ensureActivity();
+  startTyping(chatId);
+  let full = "";
+  const onEvent = (e) => {
+    if (e.type === "session") {
+      state.set({ cliSessions: { ...state.get().cliSessions, [repo]: e.id } });
+    } else if (e.type === "tool") {
+      view.addTool(e.label);
+    } else if (e.type === "text") {
+      full += (full ? "\n\n" : "") + e.text;
+    } else if (e.type === "result") {
+      if (e.text && !full) full = e.text;
+      view.cliCost = e.cost;
+      view.cliError = e.isError;
+    } else if (e.type === "error") {
+      full += `\n\n⚠️ ${e.message}`;
+    }
+  };
+  let runner;
+  try {
+    runner =
+      engine === "claude"
+        ? cliagent.runClaude({ dir, prompt: text, sessionId: sid, yolo, onEvent })
+        : cliagent.runCodex({ dir, prompt: text, yolo, onEvent });
+  } catch (e) {
+    stopTyping(chatId);
+    await view.finalize("");
+    return push(chatId, `⚠️ Could not start ${esc(ENGINE_LABEL[engine])}: <code>${esc(e.message)}</code>`);
+  }
+  cliChildren.set(chatId, runner.child);
+  let res;
+  try {
+    res = await runner.done;
+  } finally {
+    cliChildren.delete(chatId);
+    stopTyping(chatId);
+  }
+  if (!full.trim() && res && res.plain) full = res.plain;
+  await view.finalize(full || "");
+  if (!full.trim()) {
+    const err = (res && (res.stderr || "").split("\n").find((l) => l && !/DEP0190|trace-deprecation|claude-mem|platform/i.test(l))) || "";
+    await push(chatId, err ? `⚠️ No output. <code>${esc(err.slice(0, 300))}</code>` : "✅ Finished (no text output).");
+  }
+  if (view.cliCost) await push(chatId, `💰 <b>$${view.cliCost.toFixed(4)}</b>${view.cliError ? " · ⚠️ ended with an error" : ""} <i>[${esc(ENGINE_LABEL[engine])}]</i>`);
+  if (!quiet()) await offerTurnControls(chatId);
+}
+
 async function sendPrompt(chatId, parts, opts = {}) {
   const repo = activeRepoName();
+  const engine = repoEngine(repo);
+  if (engine === "claude" || engine === "codex") {
+    const text = parts.filter((p) => p.type === "text").map((p) => p.text).join("\n\n");
+    const hasFiles = parts.some((p) => p.type === "file");
+    if (hasFiles) await push(chatId, "ℹ️ Files/images are only sent to opencode sessions — using the text only here.");
+    if (!text.trim()) return push(chatId, "Send some text for this agent.");
+    return runCliAgent(chatId, repo, engine, text);
+  }
   const inst = manager.get(repo);
   if (!inst) {
     await push(chatId, "⚠️ No active repo — use /repo first.");
@@ -517,8 +598,29 @@ async function sessionsView() {
   return { html: `<b>repo: ${esc(repo)}</b>\n\n${lines.join("\n")}\n\n<i>Tap a number to switch:</i>`, kb };
 }
 
+const lastClaudeSessions = new Map();
+function claudeSessionsView(chatId) {
+  const repo = activeRepoName();
+  const dir = repoDir(repo);
+  const list = cliagent.listClaudeSessions(dir, 12);
+  lastClaudeSessions.set(chatId, list.map((s) => s.id));
+  const active = state.get().cliSessions[repo];
+  const kb = new InlineKeyboard();
+  if (!list.length) {
+    kb.text("⬅️ Menu", "mn|home");
+    return { html: `<b>Claude sessions — ${esc(repo)}</b>\n\nNone found yet. Send a message to start one.`, kb };
+  }
+  list.forEach((s, i) => {
+    kb.text(`${s.id === active ? "▶️" : ""}${i + 1}`, `cs|${i}`);
+    if (i % 5 === 4) kb.row();
+  });
+  kb.row().text("⬅️ Menu", "mn|home");
+  const lines = list.map((s, i) => `${s.id === active ? "▶️" : `<b>${i + 1}.</b>`} ${esc(s.title)}`);
+  return { html: `<b>Claude sessions — ${esc(repo)}</b>\n${lines.join("\n")}\n\n<i>Tap a number to resume it.</i>`, kb };
+}
+
 async function sessionsList(chatId) {
-  const v = await sessionsView();
+  const v = repoEngine(activeRepoName()) === "claude" ? claudeSessionsView(chatId) : await sessionsView();
   await push(chatId, v.html, { reply_markup: v.kb });
 }
 
@@ -546,6 +648,7 @@ const HELP_TEXT = [
   "/new — fresh session (asks what to do) · /new &lt;title&gt;",
   "/sessions — list + tap to switch · /switch &lt;n&gt;",
   "/abort — stop current task · /cancel — drop a pending prompt",
+  "/engine — pick agent: opencode / Claude Code / Codex",
   "/repo — list · /repo &lt;name&gt; — switch",
   "/repo add &lt;name&gt; &lt;path&gt; — add a repo",
   "/repo remove &lt;name&gt;",
@@ -570,15 +673,15 @@ function menuKeyboard() {
     .text("🆕 New", "mn|new").text("📋 Sessions", "mn|sessions").row()
     .text("🔀 Git", "mn|git").text("⚡ Templates", "mn|templates").row()
     .text("📂 Files", "mn|files").text("🌿 Branch", "mn|branch").row()
-    .text("🎛 Mode", "mn|mode").text("🤖 Agent", "mn|agent").row()
-    .text("🧠 Model", "mn|model").text("📁 Repos", "mn|repo").row()
+    .text("🧩 Engine", "mn|engine").text("🤖 Agent", "mn|agent").row()
+    .text("🎛 Mode", "mn|mode").text("🧠 Model", "mn|model").row()
+    .text("📁 Repos", "mn|repo").text("📊 Status", "mn|status").row()
     .text("🔁 Diff", "mn|diff").text("✅ Todos", "mn|todos").row()
     .text("💰 Cost", "mn|cost").text("📊 Usage", "mn|usage").row()
     .text("⏰ Schedule", "mn|schedule").text("🔔 Pending", "mn|pending").row()
     .text("⚡ YOLO", "mn|yolo").text("🛑 Abort", "mn|abort").row()
     .text("🩺 Doctor", "mn|doctor").text("📜 Logs", "mn|logs").row()
-    .text("🔎 Grep", "mn|grep").text("📊 Status", "mn|status").row()
-    .text("❓ Help", "mn|help");
+    .text("🔎 Grep", "mn|grep").text("❓ Help", "mn|help");
 }
 
 // A keyboard with just a Back-to-menu button (used by sub-panels).
@@ -626,6 +729,16 @@ async function askNewSession(chatId) {
 
 async function doAbort(chatId) {
   const repo = activeRepoName();
+  const child = cliChildren.get(chatId);
+  if (child) {
+    try {
+      child.kill();
+    } catch {}
+    cliChildren.delete(chatId);
+    stopTyping(chatId);
+    return push(chatId, "🛑 Stopped the CLI agent.");
+  }
+  if (repoEngine(repo) !== "opencode") return push(chatId, "Nothing running.");
   const sid = state.get().activeSessions[repo];
   if (!sid) return push(chatId, "No active session.");
   try {
@@ -816,7 +929,7 @@ async function statusView() {
   } catch {}
   const yolo = state.get().yolo[repo] ? "ON ⚡" : "off";
   return {
-    html: `🟢 TeleCode bridge\nopencode: <code>${esc(version)}</code>\nrepo: <b>${esc(repo)}</b>\nsession: ${esc(title)}\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\nmodel: <b>${esc(state.get().activeModels[repo] || "default")}</b>\nagent: <b>${esc(state.get().activeAgents[repo] || "default")}</b>\nyolo: <b>${yolo}</b>\npending asks: ${pendingAsks.size}`,
+    html: `🟢 TeleCode bridge\nengine: <b>${esc(ENGINE_LABEL[repoEngine(repo)])}</b>\nopencode: <code>${esc(version)}</code>\nrepo: <b>${esc(repo)}</b>\nsession: ${esc(title)}\n<code>${esc(sid || "-")}</code>\nstatus: <b>${esc(statusLine)}</b>\nmodel: <b>${esc(state.get().activeModels[repo] || "default")}</b>\nagent: <b>${esc(state.get().activeAgents[repo] || "default")}</b>\nyolo: <b>${yolo}</b>\npending asks: ${pendingAsks.size}`,
     kb: backKb()
   };
 }
@@ -848,6 +961,27 @@ async function doRepoList(chatId) {
 async function doStatus(chatId) {
   const v = await statusView();
   await push(chatId, v.html, { reply_markup: v.kb });
+}
+
+// ── Agent engine selection ─────────────────────────────────────────────
+async function engineView() {
+  const repo = activeRepoName();
+  const cur = repoEngine(repo);
+  const claudeOk = await cliagent.has("claude");
+  const codexOk = await cliagent.has("codex");
+  const mark = (e) => (cur === e ? "● " : "");
+  const kb = new InlineKeyboard()
+    .text(`${mark("opencode")}opencode`, "eng|opencode")
+    .row()
+    .text(`${mark("claude")}Claude Code${claudeOk ? "" : " ⚠️"}`, "eng|claude")
+    .row()
+    .text(`${mark("codex")}Codex${codexOk ? "" : " ⚠️"}`, "eng|codex")
+    .row()
+    .text("⬅️ Menu", "mn|home");
+  return {
+    html: `🧩 <b>Agent — ${esc(repo)}</b>\ncurrent: <b>${esc(ENGINE_LABEL[cur])}</b>\n\n• <b>opencode</b> — live server, full features (streaming, approvals)\n• <b>Claude Code / Codex</b> — run via their CLI (prompt + stream, resume)\n\n⚠️ = CLI not found on PATH.\nTap to switch the engine for this repo:`,
+    kb
+  };
 }
 
 // ── YOLO (auto-approve) ────────────────────────────────────────────────
@@ -891,6 +1025,7 @@ async function doctorView() {
     } catch {}
     lines.push(`repo <b>${esc(name)}</b>: dir ${exists ? "✅" : "❌"} · opencode ${healthy ? "✅ :" + r.port : "❌"}`);
   }
+  lines.push(`engines: opencode ✅ · Claude ${(await cliagent.has("claude")) ? "✅" : "—"} · Codex ${(await cliagent.has("codex")) ? "✅" : "—"}`);
   lines.push(`voice (STT): ${stt.enabled() ? "✅ configured" : "off"}`);
   lines.push(`GitHub CLI: ${(await gh.available()) ? "✅" : "not installed"}`);
   lines.push(`DND: ${state.get().dnd ? `${state.get().dnd.from}–${state.get().dnd.to}${quiet() ? " (quiet now)" : ""}` : "off"}`);
@@ -1337,6 +1472,10 @@ function registerCommands() {
   bot.command("start", (ctx) => push(ctx.chat.id, HELP_TEXT));
   bot.command("help", (ctx) => push(ctx.chat.id, HELP_TEXT));
   bot.command("menu", (ctx) => sendMenu(ctx.chat.id));
+  bot.command("engine", async (ctx) => {
+    const v = await engineView();
+    await push(ctx.chat.id, v.html, { reply_markup: v.kb });
+  });
   bot.command("yolo", (ctx) => doYolo(ctx.chat.id));
   bot.command("commit", (ctx) => doCommit(ctx.chat.id, (ctx.match || "").trim()));
   bot.command("push", (ctx) => doPush(ctx.chat.id));
@@ -1652,7 +1791,8 @@ function registerCallbacks() {
         switch (action) {
           case "home": await showView(ctx, menuView()); break;
           case "new": pendingInput.set(chatId, { type: "new_session" }); await showView(ctx, newSessionView()); break;
-          case "sessions": await showView(ctx, await sessionsView()); break;
+          case "sessions": await showView(ctx, repoEngine(activeRepoName()) === "claude" ? claudeSessionsView(chatId) : await sessionsView()); break;
+          case "engine": await showView(ctx, await engineView()); break;
           case "status": await showView(ctx, await statusView()); break;
           case "mode": await showView(ctx, await modeView()); break;
           case "diff": await showView(ctx, await diffView()); break;
@@ -1716,6 +1856,25 @@ function registerCallbacks() {
         await ctx.answerCallbackQuery().catch(() => {});
         if (state.get().repos[name]) state.set({ activeRepo: name });
         await showView(ctx, reposView());
+        return;
+      }
+      if (data.startsWith("eng|")) {
+        const [, name] = data.split("|");
+        console.log(`[cb] engine switch: ${data}`);
+        const repo = activeRepoName();
+        state.set({ engines: { ...state.get().engines, [repo]: name } });
+        await ctx.answerCallbackQuery({ text: ENGINE_LABEL[name] || name }).catch(() => {});
+        await showView(ctx, await engineView());
+        return;
+      }
+      if (data.startsWith("cs|")) {
+        const [, iStr] = data.split("|");
+        console.log(`[cb] claude session resume: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        const repo = activeRepoName();
+        const id = (lastClaudeSessions.get(ctx.chat.id) || [])[Number(iStr)];
+        if (id) state.set({ cliSessions: { ...state.get().cliSessions, [repo]: id } });
+        await showView(ctx, claudeSessionsView(ctx.chat.id));
         return;
       }
       if (data.startsWith("ag|")) {
@@ -2090,6 +2249,7 @@ async function main() {
     { command: "abort", description: "Stop the current task" },
     { command: "cancel", description: "Cancel a pending prompt" },
     { command: "repo", description: "List / switch / add repos" },
+    { command: "engine", description: "Pick agent: opencode/Claude/Codex" },
     { command: "model", description: "Show or set the model" },
     { command: "mode", description: "Switch plan / build mode" },
     { command: "agent", description: "Show or set the agent" },

@@ -23,7 +23,9 @@ const defaults = {
   allowedUsers: [],
   budgetLimit: 0,
   recentModels: [],
-  dnd: null
+  dnd: null,
+  engines: {},
+  cliSessions: {}
 };
 
 let state = { ...defaults };
@@ -50,6 +52,8 @@ function migrate(data) {
   data.budgetLimit = Number(data.budgetLimit) || 0;
   data.recentModels = Array.isArray(data.recentModels) ? data.recentModels : [];
   data.dnd = data.dnd && typeof data.dnd === "object" ? data.dnd : null;
+  data.engines = data.engines || {};
+  data.cliSessions = data.cliSessions || {};
   if (!Object.keys(data.repos).length) {
     data.repos[DEFAULT_REPO] = { dir: DEFAULT_WORKSPACE, port: 4096 };
     delete data.activeSessionId;

@@ -44,6 +44,7 @@ bot  ◂  🚀 Pushed feature/dark-mode.   [ 🔀 Open PR ] [ 🐙 CI ]
 ## 🚀 Features
 
 **Core**
+- 🧩 **Multi-agent** — drive [opencode](https://opencode.ai) (live server), **Claude Code**, or **Codex** per repo; pick the engine from the menu.
 - 💬 **Live streaming** — assistant text and tool activity update in place, with an elapsed-time indicator.
 - 🔐 **Approvals & questions** — permission requests and agent questions become inline buttons (or just type your answer).
 - 🧭 **One morphing menu** — `/menu` is a single message that navigates in place, so the chat stays clean.
