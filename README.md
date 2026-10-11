@@ -95,6 +95,25 @@ npm start
 
 Then open your bot in Telegram, tap **Start**, and send `/menu`.
 
+## 🧩 Agents (engines)
+
+TeleCode can drive three coding agents. Pick one per repo from the menu
+(**🧩 Engine**) or with `/engine` — each is optional and used only if its CLI
+is installed and on your `PATH`:
+
+| Engine | Needs | Notes |
+| --- | --- | --- |
+| **opencode** | [`opencode`](https://opencode.ai) | Live server: full streaming, and approvals for **any** session (even ones you started elsewhere). |
+| **Claude Code** | [`claude`](https://docs.anthropic.com/en/docs/claude-code) 2.x, logged in | Runs headless (`claude -p`), streams back, resumes sessions. With **YOLO off**, it asks you on Telegram before each tool (Allow / Allow-all / Deny); safe reads aren't nagged. |
+| **Codex** | [`codex`](https://github.com/openai/codex) | Runs `codex exec`, streams back. |
+
+If an engine's CLI isn't found, the menu shows ⚠️ and TeleCode falls back
+gracefully — nothing breaks. Each agent uses **your own** local login /
+subscription; TeleCode never shares credentials between them.
+
+> The Claude approval bridge is self-contained (a tiny local MCP server on
+> `127.0.0.1` with a per-run secret) and ships with the repo — no setup needed.
+
 ## 🎛 Commands
 
 | Command | Does |
@@ -103,6 +122,7 @@ Then open your bot in Telegram, tap **Start**, and send `/menu`.
 | `/menu` | The button menu for everything |
 | `/new` · `/sessions` · `/switch` | New session (asks what to do) · list · switch |
 | `/abort` · `/cancel` · `/revert` | Stop task · drop a prompt · undo last turn |
+| `/engine` | Pick the agent: opencode / Claude Code / Codex |
 | `/repo` · `/branch` · `/mode` · `/agent` · `/model` | Switch project / branch / plan↔build / agent / model |
 | `/commit` · `/push` · `/diff` | Git from your pocket |
 | `/ci` · `/prs` · `/issue` | GitHub CI / pull requests / new issue |
