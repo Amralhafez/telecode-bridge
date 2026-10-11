@@ -293,7 +293,7 @@ async function runCliAgent(chatId, repo, engine, text) {
     runner =
       engine === "claude"
         ? cliagent.runClaude({ dir, prompt: text, sessionId: sid, yolo, approval: claudeApproval, onEvent })
-        : cliagent.runCodex({ dir, prompt: text, yolo, onEvent });
+        : cliagent.runCodex({ dir, prompt: text, sessionId: sid, yolo, onEvent });
   } catch (e) {
     stopTyping(chatId);
     await view.finalize("");
@@ -986,27 +986,37 @@ async function addRepoByPath(chatId, dir, nameHint) {
 }
 
 const lastRepoBrowse = new Map();
-function addRepoBrowseView(chatId, absDir) {
+const REPO_PER_PAGE = 16;
+function addRepoBrowseView(chatId, absDir, page = 0) {
   let info;
   try {
     info = files.browseDirs(absDir);
   } catch (e) {
     return { html: `⚠️ ${esc(e.message)}`, kb: new InlineKeyboard().text("⬅️ Repos", "mn|repo") };
   }
-  lastRepoBrowse.set(chatId, { dir: absDir, subdirs: info.dirs });
+  const total = info.dirs.length;
+  const pages = Math.max(1, Math.ceil(total / REPO_PER_PAGE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  lastRepoBrowse.set(chatId, { dir: absDir, subdirs: info.dirs, page });
   const kb = new InlineKeyboard();
   kb.text("➕ Add this folder", "ra|add").text("🔎 Find git repos", "ra|scan").row();
   const parent = path.dirname(absDir);
   if (parent && parent !== absDir) kb.text("⬆️ ..", "ra|up").row();
-  const shown = info.dirs.slice(0, 16);
-  shown.forEach((d, i) => {
-    kb.text(`📁 ${d.slice(0, 22)}`, `ra|cd|${i}`);
+  const start = page * REPO_PER_PAGE;
+  const slice = info.dirs.slice(start, start + REPO_PER_PAGE);
+  slice.forEach((d, i) => {
+    kb.text(`📁 ${d.slice(0, 22)}`, `ra|cd|${start + i}`);
     if (i % 2 === 1) kb.row();
   });
-  if (shown.length % 2 === 1) kb.row();
+  if (slice.length % 2 === 1) kb.row();
+  if (pages > 1) {
+    if (page > 0) kb.text("◀ Prev", `ra|pg|${page - 1}`);
+    if (page < pages - 1) kb.text("Next ▶", `ra|pg|${page + 1}`);
+    kb.row();
+  }
   kb.text("⬅️ Repos", "mn|repo");
   return {
-    html: `➕ <b>Add a repo</b>\n<code>${esc(absDir)}</code>${info.isGit ? "\n✅ this folder is a git repo" : ""}\n\nOpen a folder, then tap “Add this folder”.`,
+    html: `➕ <b>Add a repo</b>\n<code>${esc(absDir)}</code>${info.isGit ? "\n✅ this folder is a git repo" : ""}\n${total} folder(s)${pages > 1 ? ` · page ${page + 1}/${pages}` : ""}\n\nOpen a folder, then tap “Add this folder”.`,
     kb
   };
 }
@@ -2039,6 +2049,8 @@ function registerCallbacks() {
           await showView(ctx, repoScanView(ctx.chat.id));
         } else if (act === "up") {
           if (b) await showView(ctx, addRepoBrowseView(ctx.chat.id, path.dirname(b.dir)));
+        } else if (act === "pg") {
+          if (b) await showView(ctx, addRepoBrowseView(ctx.chat.id, b.dir, Number(iStr)));
         } else if (act === "cd") {
           if (b) {
             const name = b.subdirs[Number(iStr)];

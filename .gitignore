@@ -4,3 +4,4 @@ state.json
 logs/
 bridge.lock
 *.log
+opencode.json

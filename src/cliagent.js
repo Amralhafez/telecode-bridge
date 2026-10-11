@@ -87,10 +87,15 @@ function runClaude({ dir, prompt, sessionId, yolo, approval, onEvent }) {
   return { child, done };
 }
 
-// Run Codex headless (best-effort; format may vary by version).
-function runCodex({ dir, prompt, yolo, onEvent }) {
-  const args = ["exec", "--json"];
-  if (yolo) args.push("--dangerously-bypass-approvals-and-sandbox");
+// Run Codex headless via `codex exec --json`. Safety is sandbox-based:
+// YOLO -> full bypass; otherwise a workspace-write sandbox (edits the repo,
+// can't escape it) with no interactive prompts so it doesn't hang.
+function runCodex({ dir, prompt, sessionId, yolo, onEvent }) {
+  const base = sessionId ? ["exec", "resume", sessionId] : ["exec"];
+  const policy = yolo
+    ? ["--dangerously-bypass-approvals-and-sandbox"]
+    : ["--sandbox", "workspace-write", "--ask-for-approval", "never"];
+  const args = [...base, "--json", ...policy];
   const child = spawn("codex", args, { cwd: dir, shell: true, windowsHide: true });
   const done = parseStream(child, onEvent, "codex");
   writeStdin(child, prompt);
