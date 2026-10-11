@@ -1,5 +1,6 @@
 require("dotenv").config();
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { Bot, InlineKeyboard, InputFile } = require("grammy");
 const { ServerManager } = require("./oc");
@@ -826,11 +827,96 @@ function reposView() {
     if (i % 2 === 1) kb.row();
   });
   if (names.length % 2 === 1) kb.row();
+  kb.text("➕ Add repo", "ra|open").text("🔎 Find repos", "ra|scan").row();
   kb.text("⬅️ Menu", "mn|home");
   const lines = Object.entries(repos).map(([name, r]) =>
-    `${name === active ? "▶️" : "•"} <b>${esc(name)}</b> — <code>${esc(r.dir)}</code> :${r.port}`
+    `${name === active ? "▶️" : "•"} <b>${esc(name)}</b> <i>${esc(ENGINE_LABEL[repoEngine(name)])}</i>\n   <code>${esc(r.dir)}</code>`
   );
-  return { html: `<b>Repos</b> — tap to switch\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`, kb };
+  return { html: `<b>Repos</b> — tap to switch\n${lines.join("\n") || "none"}`, kb };
+}
+
+// Register a folder as a repo. Auto-names (and de-dupes) so there's no typing.
+async function addRepoByPath(chatId, dir, nameHint) {
+  if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    await push(chatId, `⚠️ Not a directory: <code>${esc(dir)}</code>`);
+    return null;
+  }
+  const already = Object.entries(state.get().repos).find(([, r]) => r.dir === dir);
+  if (already) {
+    state.set({ activeRepo: already[0] });
+    await push(chatId, `▶️ Already added as <b>${esc(already[0])}</b> — made it active.`);
+    return { name: already[0] };
+  }
+  const base = (nameHint || path.basename(dir.replace(/[\\/]+$/, "")) || "repo").toLowerCase().replace(/[^a-z0-9-]/g, "") || "repo";
+  let name = base;
+  let i = 2;
+  while (state.get().repos[name]) name = `${base}-${i++}`;
+  const port = manager.allocPort();
+  let note = "";
+  try {
+    const cfgPath = path.join(dir, "opencode.json");
+    if (!fs.existsSync(cfgPath)) {
+      fs.writeFileSync(cfgPath, JSON.stringify(POLICY, null, 2));
+      note = " (policy written)";
+    }
+  } catch {}
+  manager.register(name, dir, port);
+  state.set({ repos: { ...state.get().repos, [name]: { dir, port } }, activeRepo: name });
+  try {
+    await manager.get(name).ensure();
+    manager.get(name).watchEvents(handleEvent(name));
+  } catch (e) {
+    await push(chatId, `📁 Added <b>${esc(name)}</b> but opencode didn't start: ${esc(e.message)}\n<code>${esc(dir)}</code>`);
+    return { name, port };
+  }
+  await push(chatId, `📁 Repo <b>${esc(name)}</b> added &amp; active${esc(note)}\n<code>${esc(dir)}</code> :${port}`);
+  return { name, port };
+}
+
+const lastRepoBrowse = new Map();
+function addRepoBrowseView(chatId, absDir) {
+  let info;
+  try {
+    info = files.browseDirs(absDir);
+  } catch (e) {
+    return { html: `⚠️ ${esc(e.message)}`, kb: new InlineKeyboard().text("⬅️ Repos", "mn|repo") };
+  }
+  lastRepoBrowse.set(chatId, { dir: absDir, subdirs: info.dirs });
+  const kb = new InlineKeyboard();
+  kb.text("➕ Add this folder", "ra|add").text("🔎 Find git repos", "ra|scan").row();
+  const parent = path.dirname(absDir);
+  if (parent && parent !== absDir) kb.text("⬆️ ..", "ra|up").row();
+  const shown = info.dirs.slice(0, 16);
+  shown.forEach((d, i) => {
+    kb.text(`📁 ${d.slice(0, 22)}`, `ra|cd|${i}`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (shown.length % 2 === 1) kb.row();
+  kb.text("⬅️ Repos", "mn|repo");
+  return {
+    html: `➕ <b>Add a repo</b>\n<code>${esc(absDir)}</code>${info.isGit ? "\n✅ this folder is a git repo" : ""}\n\nOpen a folder, then tap “Add this folder”.`,
+    kb
+  };
+}
+
+const lastRepoScan = new Map();
+function repoScanView(chatId) {
+  const base = os.homedir();
+  const found = files.findGitRepos(base, 2, 30);
+  lastRepoScan.set(chatId, found);
+  const existing = new Set(Object.values(state.get().repos).map((r) => r.dir));
+  const kb = new InlineKeyboard();
+  found.slice(0, 20).forEach((p, i) => {
+    const already = existing.has(p);
+    kb.text(`${already ? "✓ " : "➕ "}${path.basename(p).slice(0, 26)}`, `ra|quick|${i}`).row();
+  });
+  kb.text("⬅️ Back", "ra|open");
+  return {
+    html: found.length
+      ? `🔎 <b>Found ${found.length} git repo(s)</b> under your home folder.\nTap one to add (✓ = already added):`
+      : "🔎 No git repos found under your home folder. Use “Add a repo” to browse.",
+    kb
+  };
 }
 
 async function agentView() {
@@ -1619,47 +1705,15 @@ function registerCommands() {
       await push(ctx.chat.id, `<b>Repos</b>\n${lines.join("\n") || "none"}\n\n/repo add &lt;name&gt; &lt;path&gt;`);
       return;
     }
+    if (arg === "add" || arg === "add ") {
+      // No path given — open the folder picker instead of asking for text.
+      const v = addRepoBrowseView(ctx.chat.id, os.homedir());
+      await push(ctx.chat.id, v.html, { reply_markup: v.kb });
+      return;
+    }
     if (arg.startsWith("add ")) {
-      const rest = arg.slice(4).trim();
-      const sp = rest.indexOf(" ");
-      if (sp < 0) {
-        await push(ctx.chat.id, "Usage: /repo add &lt;name&gt; &lt;path&gt;");
-        return;
-      }
-      const name = rest.slice(0, sp).toLowerCase().replace(/[^a-z0-9-]/g, "");
-      const dir = rest.slice(sp + 1).trim();
-      if (!name || !dir) {
-        await push(ctx.chat.id, "Usage: /repo add &lt;name&gt; &lt;path&gt;");
-        return;
-      }
-      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
-        await push(ctx.chat.id, `⚠️ Not a directory: <code>${esc(dir)}</code>`);
-        return;
-      }
-      if (repos[name]) {
-        await push(ctx.chat.id, `⚠️ Repo <b>${esc(name)}</b> exists — /repo remove ${esc(name)} first.`);
-        return;
-      }
-      const port = manager.allocPort();
-      const cfgPath = path.join(dir, "opencode.json");
-      let policyNote = "";
-      if (!fs.existsSync(cfgPath)) {
-        fs.writeFileSync(cfgPath, JSON.stringify(POLICY, null, 2));
-        policyNote = " (bash-ask policy written)";
-      }
-      manager.register(name, dir, port);
-      state.set({
-        repos: { ...repos, [name]: { dir, port } },
-        activeRepo: name
-      });
-      try {
-        await manager.get(name).ensure();
-      } catch (e) {
-        await push(ctx.chat.id, `⚠️ Repo added but server failed: ${esc(e.message)}`);
-        return;
-      }
-      manager.get(name).watchEvents(handleEvent(name));
-      await push(ctx.chat.id, `📁 Repo <b>${esc(name)}</b> added &amp; active${esc(policyNote)}\n<code>${esc(dir)}</code> :${port}`);
+      // Whole remainder is the path; name is auto-derived (no typing a name).
+      await addRepoByPath(ctx.chat.id, arg.slice(4).trim());
       return;
     }
     if (arg.startsWith("remove ")) {
@@ -1856,6 +1910,36 @@ function registerCallbacks() {
         await ctx.answerCallbackQuery().catch(() => {});
         if (state.get().repos[name]) state.set({ activeRepo: name });
         await showView(ctx, reposView());
+        return;
+      }
+      if (data.startsWith("ra|")) {
+        const [, act, iStr] = data.split("|");
+        console.log(`[cb] add-repo: ${data}`);
+        await ctx.answerCallbackQuery().catch(() => {});
+        const b = lastRepoBrowse.get(ctx.chat.id);
+        if (act === "open") {
+          await showView(ctx, addRepoBrowseView(ctx.chat.id, (b && b.dir) || os.homedir()));
+        } else if (act === "scan") {
+          await showView(ctx, repoScanView(ctx.chat.id));
+        } else if (act === "up") {
+          if (b) await showView(ctx, addRepoBrowseView(ctx.chat.id, path.dirname(b.dir)));
+        } else if (act === "cd") {
+          if (b) {
+            const name = b.subdirs[Number(iStr)];
+            if (name) await showView(ctx, addRepoBrowseView(ctx.chat.id, path.join(b.dir, name)));
+          }
+        } else if (act === "add") {
+          if (b) {
+            await addRepoByPath(ctx.chat.id, b.dir);
+            await showView(ctx, reposView());
+          }
+        } else if (act === "quick") {
+          const p = (lastRepoScan.get(ctx.chat.id) || [])[Number(iStr)];
+          if (p) {
+            await addRepoByPath(ctx.chat.id, p);
+            await showView(ctx, reposView());
+          }
+        }
         return;
       }
       if (data.startsWith("eng|")) {

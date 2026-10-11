@@ -81,4 +81,53 @@ function search(root, pattern) {
   });
 }
 
-module.exports = { resolveIn, relOf, list, readFile, isProbablyText, tail, search, MAX_VIEW_BYTES };
+// ── Directory browsing for adding repos (not confined to one root) ──────
+const SKIP_BROWSE = new Set([
+  "node_modules", "AppData", "Windows", "Program Files", "Program Files (x86)",
+  "$Recycle.Bin", "ProgramData", "System Volume Information", "Default", "Public"
+]);
+
+function browseDirs(absDir) {
+  const entries = fs.readdirSync(absDir, { withFileTypes: true });
+  const dirs = [];
+  let isGit = false;
+  for (const e of entries) {
+    if (e.name === ".git") isGit = true;
+    if (!e.isDirectory()) continue;
+    if (SKIP_BROWSE.has(e.name) || e.name.startsWith(".")) continue;
+    dirs.push(e.name);
+  }
+  dirs.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  return { dirs, isGit };
+}
+
+// Walk `base` looking for folders that contain a .git (i.e. real repos).
+function findGitRepos(base, maxDepth = 2, limit = 40) {
+  const out = [];
+  const walk = (dir, depth) => {
+    if (out.length >= limit || depth > maxDepth) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((e) => e.name === ".git" && e.isDirectory())) {
+      out.push(dir);
+      return; // don't descend into a repo
+    }
+    for (const e of entries) {
+      if (out.length >= limit) break;
+      if (!e.isDirectory()) continue;
+      if (SKIP_BROWSE.has(e.name) || e.name.startsWith(".")) continue;
+      walk(path.join(dir, e.name), depth + 1);
+    }
+  };
+  walk(base, 0);
+  return out;
+}
+
+module.exports = {
+  resolveIn, relOf, list, readFile, isProbablyText, tail, search,
+  browseDirs, findGitRepos, MAX_VIEW_BYTES
+};
