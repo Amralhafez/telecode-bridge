@@ -95,6 +95,100 @@ function repoEngine(repo) {
 const ENGINE_LABEL = { opencode: "opencode", claude: "Claude Code", codex: "Codex" };
 const cliChildren = new Map(); // chatId -> child process of an in-flight CLI run
 
+// Interactive approvals for Claude headless runs (via the claude-mcp tool).
+const claudeApproval = { configPath: null, port: 0, secret: "" };
+const claudePending = new Map(); // approvalId -> { resolve, chatId, timer }
+const claudeAllowAll = new Set(); // chatIds currently in "allow all for this run" mode
+
+function approveToolText(toolName, input) {
+  const i = input || {};
+  const arg = i.command || i.file_path || i.path || i.pattern || i.url || i.description || "";
+  return `${toolName}${arg ? "\n<code>" + esc(String(arg).slice(0, 300)) + "</code>" : ""}`;
+}
+
+function startApprovalServer() {
+  const http = require("http");
+  const crypto = require("crypto");
+  claudeApproval.secret = crypto.randomBytes(16).toString("hex");
+  const server = http.createServer((req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(404).end();
+      return;
+    }
+    req.socket.setTimeout(0);
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      let data;
+      try {
+        data = JSON.parse(body);
+      } catch {
+        res.writeHead(400).end();
+        return;
+      }
+      if (data.secret !== claudeApproval.secret) {
+        res.writeHead(403).end();
+        return;
+      }
+      const reply = (decision) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(decision));
+      };
+      const chatId = ownerChat();
+      const allow = () => reply({ behavior: "allow", updatedInput: data.input || {} });
+      if (claudeAllowAll.has(chatId)) return allow();
+      const id = crypto.randomBytes(6).toString("hex");
+      const kb = new InlineKeyboard()
+        .text("✅ Allow", `ca|${id}|allow`)
+        .text("⏩ Allow all", `ca|${id}|all`)
+        .text("❌ Deny", `ca|${id}|deny`);
+      await push(chatId, `🔐 <b>Claude wants to run a tool</b>\n${approveToolText(data.tool_name, data.input)}`, { reply_markup: kb });
+      const timer = setTimeout(() => {
+        if (claudePending.has(id)) {
+          claudePending.delete(id);
+          reply({ behavior: "deny", message: "Timed out waiting for approval." });
+        }
+      }, 10 * 60 * 1000);
+      claudePending.set(id, {
+        chatId,
+        decide: (what) => {
+          clearTimeout(timer);
+          claudePending.delete(id);
+          if (what === "deny") reply({ behavior: "deny", message: "Denied by the owner." });
+          else {
+            if (what === "all") claudeAllowAll.add(chatId);
+            allow();
+          }
+        }
+      });
+    });
+  });
+  server.listen(0, "127.0.0.1", () => {
+    claudeApproval.port = server.address().port;
+    const cfg = {
+      mcpServers: {
+        telecode: {
+          command: process.execPath,
+          args: [path.join(__dirname, "claude-mcp.js")],
+          env: {
+            TELECODE_APPROVE_URL: `http://127.0.0.1:${claudeApproval.port}/approve`,
+            TELECODE_SECRET: claudeApproval.secret
+          }
+        }
+      }
+    };
+    claudeApproval.configPath = path.join(os.tmpdir(), `telecode-claude-mcp-${process.pid}.json`);
+    try {
+      fs.writeFileSync(claudeApproval.configPath, JSON.stringify(cfg));
+      console.log(`[approval] listening on 127.0.0.1:${claudeApproval.port}`);
+    } catch (e) {
+      claudeApproval.configPath = null;
+      console.error("[approval] could not write mcp config:", e.message);
+    }
+  });
+  server.unref();
+}
+
 // Quiet hours: true when now is inside the configured DND window. Used to
 // suppress bot-initiated noise (control bars, alerts) — never replies.
 function quiet() {
@@ -193,11 +287,12 @@ async function runCliAgent(chatId, repo, engine, text) {
       full += `\n\n⚠️ ${e.message}`;
     }
   };
+  claudeAllowAll.delete(chatId);
   let runner;
   try {
     runner =
       engine === "claude"
-        ? cliagent.runClaude({ dir, prompt: text, sessionId: sid, yolo, onEvent })
+        ? cliagent.runClaude({ dir, prompt: text, sessionId: sid, yolo, approval: claudeApproval, onEvent })
         : cliagent.runCodex({ dir, prompt: text, yolo, onEvent });
   } catch (e) {
     stopTyping(chatId);
@@ -210,6 +305,7 @@ async function runCliAgent(chatId, repo, engine, text) {
     res = await runner.done;
   } finally {
     cliChildren.delete(chatId);
+    claudeAllowAll.delete(chatId);
     stopTyping(chatId);
   }
   if (!full.trim() && res && res.plain) full = res.plain;
@@ -1085,7 +1181,7 @@ async function engineView() {
     .row()
     .text("⬅️ Menu", "mn|home");
   return {
-    html: `🧩 <b>Agent — ${esc(repo)}</b>\ncurrent: <b>${esc(ENGINE_LABEL[cur])}</b>\n\n• <b>opencode</b> — live server, full features (streaming, approvals)\n• <b>Claude Code / Codex</b> — run via their CLI (prompt + stream, resume)\n\n⚠️ = CLI not found on PATH.\nTap to switch the engine for this repo:`,
+    html: `🧩 <b>Agent — ${esc(repo)}</b>\ncurrent: <b>${esc(ENGINE_LABEL[cur])}</b>\n\n• <b>opencode</b> — live server, full features (streaming, approvals)\n• <b>Claude Code</b> — CLI; with YOLO off it asks you here before each tool\n• <b>Codex</b> — CLI (prompt + stream)\n\n⚠️ = CLI not found on PATH.\nTap to switch the engine for this repo:`,
     kb
   };
 }
@@ -2047,6 +2143,21 @@ function registerCallbacks() {
         await sendPrompt(ctx.chat.id, [{ type: "text", text: "Continue." }]);
         return;
       }
+      if (data.startsWith("ca|")) {
+        const [, id, what] = data.split("|");
+        console.log(`[cb] claude approval: ${data}`);
+        const p = claudePending.get(id);
+        if (!p) {
+          await ctx.answerCallbackQuery({ text: "No longer waiting" }).catch(() => {});
+          await ctx.editMessageText("⏱ This approval already resolved.").catch(() => {});
+          return;
+        }
+        p.decide(what);
+        const label = what === "deny" ? "❌ Denied" : what === "all" ? "⏩ Allowed (all for this run)" : "✅ Allowed";
+        await ctx.editMessageText(`${label}`).catch(() => {});
+        await ctx.answerCallbackQuery({ text: label }).catch(() => {});
+        return;
+      }
       if (data.startsWith("sh|")) {
         const [, act] = data.split("|");
         console.log(`[cb] sh: ${data}`);
@@ -2334,6 +2445,7 @@ async function main() {
   });
   startReconcile();
   startScheduler();
+  startApprovalServer();
   for (const [name, inst] of manager.instances) {
     console.log(`[bridge] opencode[${name}] ${inst.adopted ? "adopted" : "spawned"} at ${inst.base} (${inst.dir})`);
     inst.watchEvents(handleEvent(name));

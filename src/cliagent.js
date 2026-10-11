@@ -69,9 +69,17 @@ function sessionTitle(file) {
 
 // Run Claude Code headless. onEvent gets {type:session|text|tool|result|error}.
 // Returns { child, done } — done resolves when the run finishes.
-function runClaude({ dir, prompt, sessionId, yolo, onEvent }) {
-  const mode = yolo ? "bypassPermissions" : "acceptEdits";
-  const args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode];
+function runClaude({ dir, prompt, sessionId, yolo, approval, onEvent }) {
+  const args = ["-p", "--output-format", "stream-json", "--verbose"];
+  if (yolo) {
+    args.push("--dangerously-skip-permissions");
+  } else if (approval && approval.configPath) {
+    // Interactive approvals: route permission prompts to our MCP tool, which
+    // asks the owner on Telegram.
+    args.push("--permission-mode", "default", "--mcp-config", approval.configPath, "--permission-prompt-tool", "mcp__telecode__approve");
+  } else {
+    args.push("--permission-mode", "acceptEdits");
+  }
   if (sessionId) args.push("--resume", sessionId);
   const child = spawn("claude", args, { cwd: dir, shell: true, windowsHide: true });
   const done = parseStream(child, onEvent, "claude");
