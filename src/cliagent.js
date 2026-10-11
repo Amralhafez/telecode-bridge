@@ -91,11 +91,9 @@ function runClaude({ dir, prompt, sessionId, yolo, approval, onEvent }) {
 // YOLO -> full bypass; otherwise a workspace-write sandbox (edits the repo,
 // can't escape it) with no interactive prompts so it doesn't hang.
 function runCodex({ dir, prompt, sessionId, yolo, onEvent }) {
-  const base = sessionId ? ["exec", "resume", sessionId] : ["exec"];
-  const policy = yolo
-    ? ["--dangerously-bypass-approvals-and-sandbox"]
-    : ["--sandbox", "workspace-write", "--ask-for-approval", "never"];
-  const args = [...base, "--json", ...policy];
+  const opts = ["--json", "--skip-git-repo-check"];
+  opts.push(...(yolo ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", "workspace-write"]));
+  const args = sessionId ? ["exec", ...opts, "resume", sessionId] : ["exec", ...opts];
   const child = spawn("codex", args, { cwd: dir, shell: true, windowsHide: true });
   const done = parseStream(child, onEvent, "codex");
   writeStdin(child, prompt);
@@ -131,12 +129,24 @@ function parseStream(child, onEvent, kind) {
       } else if (o.type === "result") {
         emit({ type: "result", text: o.result || "", cost: o.total_cost_usd || 0, isError: Boolean(o.is_error) });
       }
-      // Codex JSON (best-effort): messages carry type + text/content
+      // Codex `exec --json` events.
       else if (kind === "codex") {
-        if (o.session_id || o.id) emit({ type: "session", id: o.session_id || o.id });
-        const t = o.text || o.message || (o.msg && o.msg.text);
-        if (t && (o.type === "message" || o.role === "assistant" || o.type === "item.completed")) emit({ type: "text", text: String(t) });
-        if (o.type === "tool" || o.type === "command") emit({ type: "tool", label: String(o.name || o.command || "tool").slice(0, 100) });
+        if (o.type === "thread.started" && o.thread_id) {
+          emit({ type: "session", id: o.thread_id });
+        } else if (o.type === "item.completed" && o.item) {
+          const it = o.item;
+          if (it.type === "agent_message" && it.text) emit({ type: "text", text: it.text });
+          else if (it.type === "reasoning") {
+            /* skip chain-of-thought */
+          } else if (it.type) {
+            const lbl = it.command || it.cmd || it.path || it.text || it.type;
+            emit({ type: "tool", label: String(lbl).slice(0, 100) });
+          }
+        } else if (o.type === "turn.completed") {
+          emit({ type: "result", text: "", cost: 0 });
+        } else if (o.type === "error" || o.type === "turn.failed") {
+          emit({ type: "error", message: String(o.message || o.error || "codex error") });
+        }
       }
     };
     child.stdout.on("data", (d) => {
