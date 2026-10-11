@@ -599,6 +599,14 @@ async function sessionsView() {
   return { html: `<b>repo: ${esc(repo)}</b>\n\n${lines.join("\n")}\n\n<i>Tap a number to switch:</i>`, kb };
 }
 
+function relAge(ms) {
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
 const lastClaudeSessions = new Map();
 function claudeSessionsView(chatId) {
   const repo = activeRepoName();
@@ -609,15 +617,23 @@ function claudeSessionsView(chatId) {
   const kb = new InlineKeyboard();
   if (!list.length) {
     kb.text("⬅️ Menu", "mn|home");
-    return { html: `<b>Claude sessions — ${esc(repo)}</b>\n\nNone found yet. Send a message to start one.`, kb };
+    return { html: `🤖 <b>Claude sessions — ${esc(repo)}</b>\n\nNone yet. Just send a message to start one.`, kb };
   }
   list.forEach((s, i) => {
-    kb.text(`${s.id === active ? "▶️" : ""}${i + 1}`, `cs|${i}`);
+    const hot = Date.now() - s.mtime < 10 * 60 * 1000;
+    kb.text(`${s.id === active ? "▶️" : hot ? "🟢" : ""}${i + 1}`, `cs|${i}`);
     if (i % 5 === 4) kb.row();
   });
   kb.row().text("⬅️ Menu", "mn|home");
-  const lines = list.map((s, i) => `${s.id === active ? "▶️" : `<b>${i + 1}.</b>`} ${esc(s.title)}`);
-  return { html: `<b>Claude sessions — ${esc(repo)}</b>\n${lines.join("\n")}\n\n<i>Tap a number to resume it.</i>`, kb };
+  const lines = list.map((s, i) => {
+    const hot = Date.now() - s.mtime < 10 * 60 * 1000;
+    const dot = s.id === active ? "▶️" : hot ? "🟢" : `<b>${i + 1}.</b>`;
+    return `${dot} ${esc(s.title)} <i>· ${relAge(s.mtime)}</i>`;
+  });
+  return {
+    html: `🤖 <b>Claude sessions — ${esc(repo)}</b>\n${lines.join("\n")}\n\n🟢 = active in the last 10 min · <i>tap a number to resume.</i>`,
+    kb
+  };
 }
 
 async function sessionsList(chatId) {
@@ -1056,10 +1072,14 @@ async function engineView() {
   const claudeOk = await cliagent.has("claude");
   const codexOk = await cliagent.has("codex");
   const mark = (e) => (cur === e ? "● " : "");
+  let claudeN = 0;
+  try {
+    claudeN = cliagent.listClaudeSessions(repoDir(repo), 99).length;
+  } catch {}
   const kb = new InlineKeyboard()
     .text(`${mark("opencode")}opencode`, "eng|opencode")
     .row()
-    .text(`${mark("claude")}Claude Code${claudeOk ? "" : " ⚠️"}`, "eng|claude")
+    .text(`${mark("claude")}Claude Code${claudeOk ? (claudeN ? ` (${claudeN})` : "") : " ⚠️"}`, "eng|claude")
     .row()
     .text(`${mark("codex")}Codex${codexOk ? "" : " ⚠️"}`, "eng|codex")
     .row()
@@ -1948,7 +1968,10 @@ function registerCallbacks() {
         const repo = activeRepoName();
         state.set({ engines: { ...state.get().engines, [repo]: name } });
         await ctx.answerCallbackQuery({ text: ENGINE_LABEL[name] || name }).catch(() => {});
-        await showView(ctx, await engineView());
+        // Show that engine's sessions right away.
+        if (name === "claude") await showView(ctx, claudeSessionsView(ctx.chat.id));
+        else if (name === "opencode") await showView(ctx, await sessionsView());
+        else await showView(ctx, await engineView());
         return;
       }
       if (data.startsWith("cs|")) {
