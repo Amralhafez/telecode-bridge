@@ -732,8 +732,24 @@ function claudeSessionsView(chatId) {
   };
 }
 
+function codexInfoView() {
+  const repo = activeRepoName();
+  const id = state.get().cliSessions[repo];
+  return {
+    html: `🤖 <b>Codex — ${esc(repo)}</b>\ncurrent thread: <code>${esc(id || "none (will start fresh)")}</code>\n\nJust send a message — Codex continues this thread.\n/new starts a fresh one.`,
+    kb: backKb()
+  };
+}
+
+async function sessionsFor(chatId) {
+  const eng = repoEngine(activeRepoName());
+  if (eng === "claude") return claudeSessionsView(chatId);
+  if (eng === "codex") return codexInfoView();
+  return await sessionsView();
+}
+
 async function sessionsList(chatId) {
-  const v = repoEngine(activeRepoName()) === "claude" ? claudeSessionsView(chatId) : await sessionsView();
+  const v = await sessionsFor(chatId);
   await push(chatId, v.html, { reply_markup: v.kb });
 }
 
@@ -1971,7 +1987,7 @@ function registerCallbacks() {
         switch (action) {
           case "home": await showView(ctx, menuView()); break;
           case "new": pendingInput.set(chatId, { type: "new_session" }); await showView(ctx, newSessionView()); break;
-          case "sessions": await showView(ctx, repoEngine(activeRepoName()) === "claude" ? claudeSessionsView(chatId) : await sessionsView()); break;
+          case "sessions": await showView(ctx, await sessionsFor(chatId)); break;
           case "engine": await showView(ctx, await engineView()); break;
           case "status": await showView(ctx, await statusView()); break;
           case "mode": await showView(ctx, await modeView()); break;
@@ -2077,9 +2093,7 @@ function registerCallbacks() {
         state.set({ engines: { ...state.get().engines, [repo]: name } });
         await ctx.answerCallbackQuery({ text: ENGINE_LABEL[name] || name }).catch(() => {});
         // Show that engine's sessions right away.
-        if (name === "claude") await showView(ctx, claudeSessionsView(ctx.chat.id));
-        else if (name === "opencode") await showView(ctx, await sessionsView());
-        else await showView(ctx, await engineView());
+        await showView(ctx, await sessionsFor(ctx.chat.id));
         return;
       }
       if (data.startsWith("cs|")) {
