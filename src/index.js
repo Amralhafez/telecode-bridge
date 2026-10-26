@@ -2465,7 +2465,8 @@ async function main() {
   for (const [name, r] of Object.entries(state.get().repos)) {
     manager.register(name, r.dir, r.port);
   }
-  await manager.ensureAll();
+  const failed = await manager.ensureAll();
+  if (failed.length) console.error(`[bridge] opencode unavailable for: ${failed.join(", ")} — the bot still starts (use /doctor, other engines work)`);
   manager.startWatchdog((name) => {
     notify(ownerChat(), `🔁 opencode[${esc(name)}] crashed and was restarted by the watchdog.`);
   });
@@ -2473,6 +2474,7 @@ async function main() {
   startScheduler();
   startApprovalServer();
   for (const [name, inst] of manager.instances) {
+    if (failed.includes(name)) continue; // don't subscribe to a server that never started
     console.log(`[bridge] opencode[${name}] ${inst.adopted ? "adopted" : "spawned"} at ${inst.base} (${inst.dir})`);
     inst.watchEvents(handleEvent(name));
   }

@@ -3,6 +3,9 @@ const fs = require("fs");
 const path = require("path");
 
 const HOST = process.env.OPENCODE_HOST || "127.0.0.1";
+// Which opencode binary to run. Point OPENCODE_BIN at a specific install if the
+// one on your PATH isn't the version this bridge targets.
+const OPENCODE_BIN = process.env.OPENCODE_BIN || "opencode";
 const LOG_DIR = path.join(__dirname, "..", "logs");
 
 function sleep(ms) {
@@ -47,7 +50,7 @@ class OpenCodeServer {
     const out = fs.openSync(path.join(LOG_DIR, `serve-${this.name}.log`), "a");
     const err = fs.openSync(path.join(LOG_DIR, `serve-${this.name}.err.log`), "a");
     this.child = spawn(
-      "opencode",
+      OPENCODE_BIN,
       ["serve", "--port", String(this.port), "--hostname", HOST],
       {
         cwd: this.dir,
@@ -228,8 +231,20 @@ class ServerManager {
     return max + 1;
   }
 
+  // Start every instance, but never let one repo's failure stop the others.
+  // Returns the names that failed so the caller can report them.
   async ensureAll() {
-    for (const s of this.instances.values()) await s.ensure();
+    const failed = [];
+    for (const s of this.instances.values()) {
+      try {
+        await s.ensure();
+      } catch (e) {
+        s.lastError = e.message;
+        failed.push(s.name);
+        console.error(`[oc:${s.name}] ensure failed (continuing): ${e.message}`);
+      }
+    }
+    return failed;
   }
 
   startWatchdog(onRespawn) {
